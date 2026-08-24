@@ -1,0 +1,8 @@
+# Environment variables
+.env
+
+# Node dependencies
+node_modules/
+
+# Local credentials file
+credentials.json
