@@ -1,6 +1,8 @@
 const { google } = require("googleapis");
 const logger = require("./logger");
 
+let sheetsClient = null;
+
 function getSheets() {
   if (!sheetsClient) {
     const authConfig = process.env.GOOGLE_CREDENTIALS_JSON
