@@ -2,8 +2,9 @@
   "name": "financial-bot",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "src/bot.js",
   "scripts": {
+    "start": "node src/bot.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
