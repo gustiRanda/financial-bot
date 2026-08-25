@@ -24,7 +24,7 @@ const CONFIRM = "✅ Confirm & Add";
 const EDIT = "✏️ Edit details";
 
 //auto trx
-const AUTO_MENU = "🔁📅 Auto";
+const AUTO_MENU = "🔁 📅 Auto Transaction";
 const AUTO_ADD = "➕ Add auto-transaction";
 const AUTO_DELETE = "🗑 Delete one";
 const AUTO_TOGGLE = "⏸️▶️ Toggle active";

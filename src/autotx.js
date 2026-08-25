@@ -2,11 +2,14 @@ const { google } = require("googleapis");
 const logger = require("./logger");
 
 function getSheets() {
-  const auth = new google.auth.GoogleAuth({
-    keyFile: "credentials.json",
-    scopes: ["https://www.googleapis.com/auth/spreadsheets"]
-  });
-  return google.sheets({ version: "v4", auth });
+  if (!sheetsClient) {
+    const authConfig = process.env.GOOGLE_CREDENTIALS_JSON
+      ? { credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON), scopes: ["https://www.googleapis.com/auth/spreadsheets"] }
+      : { keyFile: "credentials.json", scopes: ["https://www.googleapis.com/auth/spreadsheets"] };
+    const auth = new google.auth.GoogleAuth(authConfig);
+    sheetsClient = google.sheets({ version: "v4", auth });
+  }
+  return sheetsClient;
 }
 
 const RANGE = "AutoTransactions!A2:J1000";
