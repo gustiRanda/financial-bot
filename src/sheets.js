@@ -7,10 +7,10 @@ let sheetsClient = null;
 
 function getSheets() {
   if (!sheetsClient) {
-    const auth = new google.auth.GoogleAuth({
-      keyFile: "credentials.json",
-      scopes: ["https://www.googleapis.com/auth/spreadsheets"]
-    });
+    const authConfig = process.env.GOOGLE_CREDENTIALS_JSON
+      ? { credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON), scopes: ["https://www.googleapis.com/auth/spreadsheets"] }
+      : { keyFile: "credentials.json", scopes: ["https://www.googleapis.com/auth/spreadsheets"] };
+    const auth = new google.auth.GoogleAuth(authConfig);
     sheetsClient = google.sheets({ version: "v4", auth });
   }
   return sheetsClient;
@@ -53,20 +53,24 @@ async function insertRow(values) {
   });
 }
 
+function mainCurrencyFormula(row) {
+  return `=ROUND(D${row} * IF(VLOOKUP(E${row}, Preferences!$H$4:$J$22, 3, FALSE) = Preferences!$F$16, 1, IFNA(GOOGLEFINANCE("CURRENCY:" & VLOOKUP(E${row}, Preferences!$H$4:$J$22, 3, FALSE) & Preferences!$F$16), 1)), 2)`;
+}
+
 async function insertTransaction({ description, category, amount, account, type }) {
   const signed = type === "income" ? Math.abs(amount) : -Math.abs(amount);
   const date = dayjs().format("YYYY-MM-DD");
-  await insertRow([date, description || "", category, signed, account, signed]);
+  await insertRow([date, description || "", category, signed, account, mainCurrencyFormula(2)]);
   return signed;
 }
 
 async function insertTransfer({ description, amount, fromAccount, toAccount, fee = 0 }) {
   const date = dayjs().format("YYYY-MM-DD");
   const desc = description || "";
-  await insertRow([date, desc, "Transfer", -Math.abs(amount), fromAccount, -Math.abs(amount)]);
-  await insertRow([date, desc, "Transfer", Math.abs(amount), toAccount, Math.abs(amount)]);
+  await insertRow([date, desc, "Transfer", -Math.abs(amount), fromAccount, mainCurrencyFormula(2)]);
+  await insertRow([date, desc, "Transfer", Math.abs(amount), toAccount, mainCurrencyFormula(2)]);
   if (fee > 0) {
-    await insertRow([date, `${desc} admin fee`.trim(), "Admin Fee", -Math.abs(fee), fromAccount, -Math.abs(fee)]);
+    await insertRow([date, `${desc} admin fee`.trim(), "Admin Fee", -Math.abs(fee), fromAccount, mainCurrencyFormula(2)]);
   }
 }
 

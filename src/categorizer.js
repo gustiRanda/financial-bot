@@ -1,5 +1,5 @@
 const EXPENSE_RULES = [
-  { match: /mcd|mcdonald|kfc|restoran|resto|warung|cafe|kopi|makan/i, hint: "food" },
+  { match: /mcd|mcdonald|kfc|restoran|resto|warung|cafe|caffe|coffee|coffe|kopi|makan/i, hint: "food" },
   { match: /indomaret|alfamart|superindo|grocery|market/i, hint: "grocery" },
   { match: /kos|sewa|\brent\b/i, hint: "kos" },
   { match: /apotek|pharmacy|clinic|dokter|hospital/i, hint: "health" },

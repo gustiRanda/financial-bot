@@ -14,6 +14,7 @@ const { extractReceiptData } = require("./ocr");
 const { parseMessage } = require("./parser");
 const { guessTransaction } = require("./categorizer");
 const { parseWithAI } = require("./ai");
+const { extractReceiptDataFromPDF } = require("./pdfOcr");
 const logger = require("./logger");
 
 const CANCEL = "❌ Cancel";
@@ -22,11 +23,25 @@ const NO_FEE = "🆓 No fee";
 const CONFIRM = "✅ Confirm & Add";
 const EDIT = "✏️ Edit details";
 
+//auto trx
+const AUTO_MENU = "🔁📅 Auto";
+const AUTO_ADD = "➕ Add auto-transaction";
+const AUTO_DELETE = "🗑 Delete one";
+const AUTO_TOGGLE = "⏸️▶️ Toggle active";
+const AUTO_BACK = "⬅️ Back";
+
 const mainKeyboard = Markup.keyboard([
   ["➕ Income", "➖ Expense"],
   ["🔁 Transfer"],
-  ["💰 Available"]
+  ["💰 Available"],
+  [AUTO_MENU]
 ]).resize();
+
+async function downloadBuffer(url) {
+  const res = await fetch(url); // Node 18+ has global fetch
+  const arrayBuffer = await res.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
 
 function parseAmount(text) {
   const value = Number(String(text).replace(/[.,\s]/g, ""));
@@ -48,9 +63,13 @@ function formatIDR(n) {
 }
 
 // ---------- Income / Expense wizard ----------
+// Every step supports a "detected*" value in scene.state (from OCR). If present,
+// a "✅ Use: ..." button is offered, but the user can always type their own value.
 
 const enterAmountStep = async ctx => {
-  await ctx.reply(`Specify an amount of ${ctx.scene.state.type}`, Markup.keyboard([[CANCEL]]).resize());
+  const detected = ctx.scene.state.detectedAmount;
+  const buttons = detected ? [[`✅ Use: Rp ${formatIDR(detected)}`], [CANCEL]] : [[CANCEL]];
+  await ctx.reply(`Specify an amount of ${ctx.scene.state.type}`, Markup.keyboard(buttons).resize());
   return ctx.wizard.next();
 };
 
@@ -61,19 +80,24 @@ const amountStep = async ctx => {
     await ctx.reply("Cancelled.", mainKeyboard);
     return ctx.scene.leave();
   }
-  const amount = parseAmount(text);
-  if (amount === null) {
+  const useMatch = text.match(/^✅\s*Use:\s*Rp\s*([\d.,]+)$/i);
+  const amount = useMatch ? Number(useMatch[1].replace(/[.,]/g, "")) : parseAmount(text);
+  if (!amount) {
     return ctx.reply("Specify an amount, or tap ❌ Cancel");
   }
   ctx.scene.state.amount = amount;
 
   const categories =
-    ctx.scene.state.type === "income"
-      ? await getIncomeCategories()
-      : await getExpenseCategories();
+    ctx.scene.state.type === "income" ? await getIncomeCategories() : await getExpenseCategories();
   ctx.scene.state.categories = categories;
 
-  await ctx.reply(`Specify a category of ${ctx.scene.state.type}`, optionKeyboard(categories));
+  const detectedCategory = ctx.scene.state.detectedCategory;
+  const options =
+    detectedCategory && categories.includes(detectedCategory)
+      ? [`✅ Use: ${detectedCategory}`, ...categories.filter(c => c !== detectedCategory)]
+      : categories;
+
+  await ctx.reply(`Specify a category of ${ctx.scene.state.type}`, optionKeyboard(options));
   return ctx.wizard.next();
 };
 
@@ -84,9 +108,8 @@ const categoryStep = async ctx => {
     await ctx.reply("Cancelled.", mainKeyboard);
     return ctx.scene.leave();
   }
-  const match = (ctx.scene.state.categories || []).find(
-    c => c.toLowerCase() === text.toLowerCase()
-  );
+  const cleaned = text.replace(/^✅\s*Use:\s*/i, "").trim();
+  const match = (ctx.scene.state.categories || []).find(c => c.toLowerCase() === cleaned.toLowerCase());
   if (!match) return ctx.reply("Pick a category from the keyboard.");
   ctx.scene.state.category = match;
 
@@ -111,9 +134,7 @@ const accountStep = async ctx => {
     return ctx.scene.leave();
   }
   const cleaned = text.replace(/^✅\s*Use:\s*/i, "").trim();
-  const match = (ctx.scene.state.accounts || []).find(
-    a => a.toLowerCase() === cleaned.toLowerCase()
-  );
+  const match = (ctx.scene.state.accounts || []).find(a => a.toLowerCase() === cleaned.toLowerCase());
   if (!match) return ctx.reply("Pick an account from the keyboard.");
   ctx.scene.state.account = match;
 
@@ -144,20 +165,17 @@ const descriptionStep = async ctx => {
   logger.info("Inserting transaction (wizard):", { amount, category, account, type, description });
   const signed = await insertTransaction({ description, category, amount, account, type });
 
-  await ctx.reply(
-    `👍 Successfully added ${signed}.0 to ${category} from ${account}!`,
-    mainKeyboard
-  );
+  await ctx.reply(`👍 Successfully added ${signed}.0 to ${category} from ${account}!`, mainKeyboard);
   return ctx.scene.leave();
 };
 
 const incomeExpenseWizard = new Scenes.WizardScene(
   "INCOME_EXPENSE_WIZARD",
-  enterAmountStep,   // 0
-  amountStep,        // 1
-  categoryStep,       // 2
-  accountStep,        // 3
-  descriptionStep      // 4
+  enterAmountStep,
+  amountStep,
+  categoryStep,
+  accountStep,
+  descriptionStep
 );
 
 // ---------- Transfer wizard ----------
@@ -254,15 +272,15 @@ const transferDescriptionStep = async ctx => {
 
 const transferWizard = new Scenes.WizardScene(
   "TRANSFER_WIZARD",
-  enterTransferAmountStep, // 0
-  transferAmountStep,      // 1
-  transferFromStep,        // 2
-  transferToStep,          // 3
-  transferFeeStep,         // 4
-  transferDescriptionStep   // 5
+  enterTransferAmountStep,
+  transferAmountStep,
+  transferFromStep,
+  transferToStep,
+  transferFeeStep,
+  transferDescriptionStep
 );
 
-// ---------- OCR confirm wizard ----------
+// ---------- OCR confirm wizard (only used when OCR got EVERYTHING confidently) ----------
 
 const ocrConfirmStep = async ctx => {
   const text = ctx.message?.text?.trim();
@@ -279,18 +297,16 @@ const ocrConfirmStep = async ctx => {
     return ctx.scene.leave();
   }
   if (text === EDIT) {
-    const { amount, description, account } = ctx.scene.state;
+    const { amount, description, category, account } = ctx.scene.state;
     logger.info("User chose to edit OCR-extracted data");
+    await ctx.reply("Confirm or override each field below.");
     await ctx.scene.enter("INCOME_EXPENSE_WIZARD", {
       type: "expense",
-      amount,
+      detectedAmount: amount,
       detectedDescription: description,
-      detectedAccount: account
+      detectedAccount: account,
+      detectedCategory: category
     });
-    const categories = await getExpenseCategories();
-    ctx.scene.state.categories = categories;
-    await ctx.reply("Specify a category of expense", optionKeyboard(categories));
-    ctx.wizard.selectStep(2);
     return;
   }
   return ctx.reply("Please tap one of the buttons.");
@@ -298,11 +314,134 @@ const ocrConfirmStep = async ctx => {
 
 const ocrConfirmWizard = new Scenes.WizardScene("OCR_CONFIRM_WIZARD", ocrConfirmStep);
 
+
+//auto trx handling
+const { listAutoTransactions, addAutoTransaction, deleteAutoTransaction, setActive } = require("./autotx");
+
+const autoTypeStep = async ctx => {
+  const text = ctx.message?.text?.trim();
+  if (!text) return;
+  if (text === CANCEL) { await ctx.reply("Cancelled.", mainKeyboard); return ctx.scene.leave(); }
+  if (!["Income", "Expense"].includes(text)) return ctx.reply("Pick a type from the keyboard.");
+  ctx.scene.state.type = text.toLowerCase();
+  await ctx.reply("Description (e.g. \"Salary\")", Markup.keyboard([[CANCEL]]).resize());
+  return ctx.wizard.next();
+};
+
+const autoDescStep = async ctx => {
+  const text = ctx.message?.text?.trim();
+  if (!text) return;
+  if (text === CANCEL) { await ctx.reply("Cancelled.", mainKeyboard); return ctx.scene.leave(); }
+  ctx.scene.state.description = text;
+  await ctx.reply("Amount", Markup.keyboard([[CANCEL]]).resize());
+  return ctx.wizard.next();
+};
+
+const autoAmountStep = async ctx => {
+  const text = ctx.message?.text?.trim();
+  if (!text) return;
+  if (text === CANCEL) { await ctx.reply("Cancelled.", mainKeyboard); return ctx.scene.leave(); }
+  const amount = parseAmount(text);
+  if (!amount) return ctx.reply("Specify a valid amount, or tap ❌ Cancel");
+  ctx.scene.state.amount = amount;
+  const categories = ctx.scene.state.type === "income" ? await getIncomeCategories() : await getExpenseCategories();
+  ctx.scene.state.categories = categories;
+  await ctx.reply("Category", optionKeyboard(categories));
+  return ctx.wizard.next();
+};
+
+const autoCategoryStep = async ctx => {
+  const text = ctx.message?.text?.trim();
+  if (!text) return;
+  if (text === CANCEL) { await ctx.reply("Cancelled.", mainKeyboard); return ctx.scene.leave(); }
+  const match = (ctx.scene.state.categories || []).find(c => c.toLowerCase() === text.toLowerCase());
+  if (!match) return ctx.reply("Pick a category from the keyboard.");
+  ctx.scene.state.category = match;
+  const accounts = await getAccounts();
+  ctx.scene.state.accounts = accounts;
+  await ctx.reply("Account", optionKeyboard(accounts));
+  return ctx.wizard.next();
+};
+
+const autoAccountStep = async ctx => {
+  const text = ctx.message?.text?.trim();
+  if (!text) return;
+  if (text === CANCEL) { await ctx.reply("Cancelled.", mainKeyboard); return ctx.scene.leave(); }
+  const match = (ctx.scene.state.accounts || []).find(a => a.toLowerCase() === text.toLowerCase());
+  if (!match) return ctx.reply("Pick an account from the keyboard.");
+  ctx.scene.state.account = match;
+  await ctx.reply("Which day of the month should this run? (1-31)", Markup.keyboard([[CANCEL]]).resize());
+  return ctx.wizard.next();
+};
+
+const autoDayStep = async ctx => {
+  const text = ctx.message?.text?.trim();
+  if (!text) return;
+  if (text === CANCEL) { await ctx.reply("Cancelled.", mainKeyboard); return ctx.scene.leave(); }
+  const day = parseInt(text, 10);
+  if (!Number.isInteger(day) || day < 1 || day > 31) return ctx.reply("Enter a day between 1 and 31, or tap ❌ Cancel");
+
+  const { type, description, amount, category, account } = ctx.scene.state;
+  await addAutoTransaction({ type, description, amount, category, account, dayOfMonth: day, chatId: ctx.chat.id });
+  logger.info("Auto-transaction created via wizard:", { type, description, amount, category, account, day, chatId: ctx.chat.id });
+  await ctx.reply(
+    `✅ Auto-transaction saved: "${description}" — Rp ${formatIDR(amount)} → ${category} (${account}) every month on day ${day}.`,
+    mainKeyboard
+  );
+  return ctx.scene.leave();
+};
+
+const autoTxAddWizard = new Scenes.WizardScene(
+  "AUTO_TX_ADD_WIZARD",
+  async ctx => { await ctx.reply("Type?", Markup.keyboard([["Income", "Expense"], [CANCEL]]).resize()); return ctx.wizard.next(); },
+  autoTypeStep,
+  autoDescStep,
+  autoAmountStep,
+  autoCategoryStep,
+  autoAccountStep,
+  autoDayStep
+);
+
+const autoPickStep = async ctx => {
+  const text = ctx.message?.text?.trim();
+  if (!text) return;
+  if (text === CANCEL) { await ctx.reply("Cancelled.", mainKeyboard); return ctx.scene.leave(); }
+  const match = text.match(/^(\d+)\./);
+  if (!match) return ctx.reply("Tap one of the numbered options.");
+  const item = ctx.scene.state.list[parseInt(match[1], 10) - 1];
+  if (!item) return ctx.reply("Tap one of the numbered options.");
+
+  if (ctx.scene.state.action === "delete") {
+    await deleteAutoTransaction(item.id);
+    await ctx.reply(`🗑 Deleted "${item.description}".`, mainKeyboard);
+  } else {
+    await setActive(item.id, !item.active);
+    await ctx.reply(`${!item.active ? "▶️ Activated" : "⏸️ Paused"} "${item.description}".`, mainKeyboard);
+  }
+  return ctx.scene.leave();
+};
+
+const autoTxPickWizard = new Scenes.WizardScene(
+  "AUTO_TX_PICK_WIZARD",
+  async ctx => {
+    const list = await listAutoTransactions();
+    ctx.scene.state.list = list;
+    if (!list.length) {
+      await ctx.reply("No auto-transactions set up yet.", mainKeyboard);
+      return ctx.scene.leave();
+    }
+    const labels = list.map((a, i) => `${i + 1}. ${a.description} — Rp ${formatIDR(a.amount)} (${a.active ? "active" : "paused"})`);
+    await ctx.reply(`Which one? (${ctx.scene.state.action})`, optionKeyboard(labels));
+    return ctx.wizard.next();
+  },
+  autoPickStep
+);
+
 // ---------- Bot ----------
 
 function createBot(token) {
   const bot = new Telegraf(token);
-  const stage = new Scenes.Stage([incomeExpenseWizard, transferWizard, ocrConfirmWizard]);
+  const stage = new Scenes.Stage([incomeExpenseWizard, transferWizard, ocrConfirmWizard, autoTxAddWizard, autoTxPickWizard]);
 
   bot.use(session());
   bot.use(stage.middleware());
@@ -330,11 +469,89 @@ function createBot(token) {
     ].join("\n");
 
     const message = `<b>💰 Financial Summary</b>\n<pre>${summaryBlock}\n\nACCOUNTS\n${accountLines.join("\n")}</pre>`;
-
     await ctx.replyWithHTML(message, mainKeyboard);
   });
 
-  // Photo -> OCR -> confirm-or-edit
+  bot.hears(AUTO_MENU, async ctx => {
+    const list = await listAutoTransactions();
+    const lines = list.length
+      ? list.map(a => `${a.active ? "🟢" : "⏸️"} ${a.description} — Rp ${formatIDR(a.amount)} → ${a.category} (${a.account}), day ${a.dayOfMonth}`)
+        : ["No auto-transactions yet."];
+      await ctx.reply(lines.join("\n"), Markup.keyboard([[AUTO_ADD], [AUTO_DELETE, AUTO_TOGGLE], [AUTO_BACK]]).resize());
+  });
+
+  bot.hears(AUTO_ADD, ctx => ctx.scene.enter("AUTO_TX_ADD_WIZARD"));
+  bot.hears(AUTO_DELETE, ctx => ctx.scene.enter("AUTO_TX_PICK_WIZARD", { action: "delete" }));
+  bot.hears(AUTO_TOGGLE, ctx => ctx.scene.enter("AUTO_TX_PICK_WIZARD", { action: "toggle" }));
+  bot.hears(AUTO_BACK, ctx => ctx.reply("Main menu", mainKeyboard));
+
+
+  bot.on("document", async ctx => {
+  const doc = ctx.message.document;
+  if (doc.mime_type !== "application/pdf") {
+    return ctx.reply("I can only read PDF documents right now (send a photo for image receipts).", mainKeyboard);
+  }
+
+  logger.info(`PDF received from user ${ctx.from?.id}: ${doc.file_name}`);
+  const fileLink = await ctx.telegram.getFileLink(doc.file_id);
+  const [accounts, expenseCategories] = await Promise.all([getAccounts(), getExpenseCategories()]);
+
+  let extracted = null;
+  try {
+    const buffer = await downloadBuffer(fileLink.href);
+    extracted = await extractReceiptDataFromPDF(buffer, accounts);
+  } catch (err) {
+    logger.error("PDF OCR failed:", err);
+  }
+
+  const matchedAccount = extracted?.account
+    ? accounts.find(a => a.toLowerCase() === extracted.account.toLowerCase())
+    : null;
+  const guessedCategory = extracted?.description
+    ? guessTransaction(extracted.description, [], expenseCategories).category
+    : null;
+
+  if (extracted?.amount && matchedAccount && guessedCategory) {
+    logger.info("PDF OCR: full confident match", { amount: extracted.amount, description: extracted.description, category: guessedCategory, account: matchedAccount });
+    await ctx.scene.enter("OCR_CONFIRM_WIZARD", {
+      amount: extracted.amount,
+      description: extracted.description || "",
+      category: guessedCategory,
+      account: matchedAccount
+    });
+    const summary = [
+      "📄 <b>Read from PDF:</b>",
+      `Amount: Rp ${formatIDR(extracted.amount)}`,
+      `Merchant: ${extracted.description || "-"}`,
+      `Category: ${guessedCategory}`,
+      `Account: ${matchedAccount}`,
+      "",
+      "Is this correct?"
+    ].join("\n");
+    await ctx.replyWithHTML(summary, Markup.keyboard([[CONFIRM], [EDIT], [CANCEL]]).resize());
+    return;
+  }
+
+  logger.info("PDF OCR: partial or no data, entering wizard with detected fields", extracted);
+  if (extracted?.amount || extracted?.description || matchedAccount) {
+    await ctx.reply("📄 Detected from PDF — confirm or override each field below.");
+  } else {
+    await ctx.reply(
+      extracted
+        ? "Couldn't read data from that PDF — it might be a scanned image rather than a text PDF. Enter the details manually."
+        : "Couldn't process that PDF — enter the details manually."
+    );
+  }
+  await ctx.scene.enter("INCOME_EXPENSE_WIZARD", {
+    type: "expense",
+    detectedAmount: extracted?.amount || null,
+    detectedDescription: extracted?.description || null,
+    detectedAccount: matchedAccount || null,
+    detectedCategory: guessedCategory || null
+  });
+});
+
+  // Photo -> OCR -> confirm (if fully confident) or wizard with quick-pick buttons
   bot.on("photo", async ctx => {
     logger.info(`Photo received from user ${ctx.from?.id}`);
     const photos = ctx.message.photo;
@@ -350,63 +567,54 @@ function createBot(token) {
       logger.error("OCR failed:", err);
     }
 
-    if (!extracted?.amount) {
-      logger.warn("OCR: no usable amount extracted, falling back to manual entry");
-      await ctx.scene.enter("INCOME_EXPENSE_WIZARD", { type: "expense" });
-      await ctx.reply(
-        extracted
-          ? "Couldn't read an amount from that receipt — enter it manually."
-          : "OCR isn't wired up yet — enter the amount manually.",
-        Markup.keyboard([[CANCEL]]).resize()
-      );
-      return;
-    }
-
-    const matchedAccount = extracted.account
+    const matchedAccount = extracted?.account
       ? accounts.find(a => a.toLowerCase() === extracted.account.toLowerCase())
       : null;
-    const { category } = guessTransaction(extracted.description || "", [], expenseCategories);
+    const guessedCategory = extracted?.description
+      ? guessTransaction(extracted.description, [], expenseCategories).category
+      : null;
 
-    if (matchedAccount && category) {
+    if (extracted?.amount && matchedAccount && guessedCategory) {
       logger.info("OCR: full confident match", {
         amount: extracted.amount,
         description: extracted.description,
-        category,
+        category: guessedCategory,
         account: matchedAccount
       });
       await ctx.scene.enter("OCR_CONFIRM_WIZARD", {
         amount: extracted.amount,
         description: extracted.description || "",
-        category,
+        category: guessedCategory,
         account: matchedAccount
       });
       const summary = [
         "📷 <b>Read from receipt:</b>",
         `Amount: Rp ${formatIDR(extracted.amount)}`,
         `Merchant: ${extracted.description || "-"}`,
-        `Category: ${category}`,
+        `Category: ${guessedCategory}`,
         `Account: ${matchedAccount}`,
         "",
         "Is this correct?"
       ].join("\n");
       await ctx.replyWithHTML(summary, Markup.keyboard([[CONFIRM], [EDIT], [CANCEL]]).resize());
-    } else {
-      logger.info("OCR: partial data, entering manual/edit flow", extracted);
-      await ctx.scene.enter("INCOME_EXPENSE_WIZARD", {
-        type: "expense",
-        amount: extracted.amount,
-        detectedDescription: extracted.description || null,
-        detectedAccount: matchedAccount || null
-      });
-      ctx.scene.state.categories = expenseCategories;
-      await ctx.reply(
-        `📷 Detected amount: Rp ${formatIDR(extracted.amount)}` +
-          (extracted.description ? `\nDetected merchant: ${extracted.description}` : "") +
-          (matchedAccount ? `\nDetected account: ${matchedAccount}` : "")
-      );
-      await ctx.reply("Specify a category of expense", optionKeyboard(expenseCategories));
-      ctx.wizard.selectStep(2);
+      return;
     }
+
+    logger.info("OCR: partial or no data, entering wizard with detected fields", extracted);
+    if (extracted?.amount || extracted?.description || matchedAccount) {
+      await ctx.reply("📷 Detected from receipt — confirm or override each field below.");
+    } else {
+      await ctx.reply(
+        extracted ? "Couldn't read this receipt clearly — enter the details manually." : "OCR isn't wired up yet — enter the amount manually."
+      );
+    }
+    await ctx.scene.enter("INCOME_EXPENSE_WIZARD", {
+      type: "expense",
+      detectedAmount: extracted?.amount || null,
+      detectedDescription: extracted?.description || null,
+      detectedAccount: matchedAccount || null,
+      detectedCategory: guessedCategory || null
+    });
   });
 
   // Free-text quick add: strict "desc amount account" shorthand first (free),

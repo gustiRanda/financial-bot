@@ -1,16 +1,9 @@
-const config =
-require("./config");
+const config = require("./config");
+const createBot = require("./bot");
+const { startAutoTransactionScheduler } = require("./autoScheduler");
 
-const createBot =
-require("./bot");
-
-const bot =
-createBot(
-  config.BOT_TOKEN
-);
-
+const bot = createBot(config.BOT_TOKEN);
+startAutoTransactionScheduler(bot);
 bot.launch();
 
-console.log(
-  "Finance bot running"
-);
+console.log("Finance bot running");
