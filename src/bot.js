@@ -27,7 +27,7 @@ const EDIT = "✏️ Edit details";
 const AUTO_MENU = "🔁 📅 Auto Transaction";
 const AUTO_ADD = "➕ Add auto-transaction";
 const AUTO_DELETE = "🗑 Delete one";
-const AUTO_TOGGLE = "⏸️▶️ Toggle active";
+const AUTO_TOGGLE = "⏸️ ▶️ Toggle active";
 const AUTO_BACK = "⬅️ Back";
 
 const mainKeyboard = Markup.keyboard([

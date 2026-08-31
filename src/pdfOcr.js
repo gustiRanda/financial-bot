@@ -1,4 +1,5 @@
-const pdfParse = require("pdf-parse");
+const pdfParseModule = require("pdf-parse");
+const pdfParse = typeof pdfParseModule === "function" ? pdfParseModule : pdfParseModule.default;
 const logger = require("./logger");
 const { parseAmountFromReceiptText, guessMerchantFromReceiptText, guessAccountFromReceiptText } = require("./receiptParsing");
 

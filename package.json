@@ -21,7 +21,7 @@
     "googleapis": "^176.0.0",
     "mime-types": "^3.0.2",
     "node-cron": "^4.6.0",
-    "pdf-parse": "^2.4.5",
+    "pdf-parse": "^1.1.1",
     "sharp": "^0.35.3",
     "telegraf": "^4.16.3",
     "tesseract.js": "^7.0.0"
