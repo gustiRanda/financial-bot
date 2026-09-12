@@ -11,10 +11,12 @@ const {
 } = require("./sheets");
 
 const { extractReceiptData } = require("./ocr");
+const { extractReceiptDataFromPDF } = require("./pdfOcr");
+const { analyzeReceiptWithAI } = require("./aiReceipt");
 const { parseMessage } = require("./parser");
 const { guessTransaction } = require("./categorizer");
 const { parseWithAI } = require("./ai");
-const { extractReceiptDataFromPDF } = require("./pdfOcr");
+const { listAutoTransactions, addAutoTransaction, deleteAutoTransaction, setActive } = require("./autotx");
 const logger = require("./logger");
 
 const CANCEL = "❌ Cancel";
@@ -22,12 +24,10 @@ const NO_DESCRIPTION = "⏭ No description";
 const NO_FEE = "🆓 No fee";
 const CONFIRM = "✅ Confirm & Add";
 const EDIT = "✏️ Edit details";
-
-//auto trx
-const AUTO_MENU = "🔁 📅 Auto Transaction";
+const AUTO_MENU = "🔁📅 Auto";
 const AUTO_ADD = "➕ Add auto-transaction";
 const AUTO_DELETE = "🗑 Delete one";
-const AUTO_TOGGLE = "⏸️ ▶️ Toggle active";
+const AUTO_TOGGLE = "⏸️▶️ Toggle active";
 const AUTO_BACK = "⬅️ Back";
 
 const mainKeyboard = Markup.keyboard([
@@ -36,12 +36,6 @@ const mainKeyboard = Markup.keyboard([
   ["💰 Available"],
   [AUTO_MENU]
 ]).resize();
-
-async function downloadBuffer(url) {
-  const res = await fetch(url); // Node 18+ has global fetch
-  const arrayBuffer = await res.arrayBuffer();
-  return Buffer.from(arrayBuffer);
-}
 
 function parseAmount(text) {
   const value = Number(String(text).replace(/[.,\s]/g, ""));
@@ -62,8 +56,14 @@ function formatIDR(n) {
   return new Intl.NumberFormat("id-ID").format(Math.round(n));
 }
 
+async function downloadBuffer(url) {
+  const res = await fetch(url); // Node 18+ has global fetch
+  const arrayBuffer = await res.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
 // ---------- Income / Expense wizard ----------
-// Every step supports a "detected*" value in scene.state (from OCR). If present,
+// Every step supports a "detected*" value in scene.state (from OCR/AI). If present,
 // a "✅ Use: ..." button is offered, but the user can always type their own value.
 
 const enterAmountStep = async ctx => {
@@ -280,7 +280,7 @@ const transferWizard = new Scenes.WizardScene(
   transferDescriptionStep
 );
 
-// ---------- OCR confirm wizard (only used when OCR got EVERYTHING confidently) ----------
+// ---------- OCR/AI confirm wizard (only used when we got EVERYTHING confidently) ----------
 
 const ocrConfirmStep = async ctx => {
   const text = ctx.message?.text?.trim();
@@ -291,14 +291,14 @@ const ocrConfirmStep = async ctx => {
   }
   if (text === CONFIRM) {
     const { amount, description, category, account } = ctx.scene.state;
-    logger.info("OCR confirmed as-is, inserting:", { amount, description, category, account });
+    logger.info("Receipt confirmed as-is, inserting:", { amount, description, category, account });
     const signed = await insertTransaction({ description, category, amount, account, type: "expense" });
     await ctx.reply(`👍 Successfully added ${signed}.0 to ${category} from ${account}!`, mainKeyboard);
     return ctx.scene.leave();
   }
   if (text === EDIT) {
     const { amount, description, category, account } = ctx.scene.state;
-    logger.info("User chose to edit OCR-extracted data");
+    logger.info("User chose to edit receipt-extracted data");
     await ctx.reply("Confirm or override each field below.");
     await ctx.scene.enter("INCOME_EXPENSE_WIZARD", {
       type: "expense",
@@ -314,9 +314,7 @@ const ocrConfirmStep = async ctx => {
 
 const ocrConfirmWizard = new Scenes.WizardScene("OCR_CONFIRM_WIZARD", ocrConfirmStep);
 
-
-//auto trx handling
-const { listAutoTransactions, addAutoTransaction, deleteAutoTransaction, setActive } = require("./autotx");
+// ---------- Auto-transaction wizards ----------
 
 const autoTypeStep = async ctx => {
   const text = ctx.message?.text?.trim();
@@ -324,7 +322,7 @@ const autoTypeStep = async ctx => {
   if (text === CANCEL) { await ctx.reply("Cancelled.", mainKeyboard); return ctx.scene.leave(); }
   if (!["Income", "Expense"].includes(text)) return ctx.reply("Pick a type from the keyboard.");
   ctx.scene.state.type = text.toLowerCase();
-  await ctx.reply("Description (e.g. \"Salary\")", Markup.keyboard([[CANCEL]]).resize());
+  await ctx.reply('Description (e.g. "Salary")', Markup.keyboard([[CANCEL]]).resize());
   return ctx.wizard.next();
 };
 
@@ -441,7 +439,13 @@ const autoTxPickWizard = new Scenes.WizardScene(
 
 function createBot(token) {
   const bot = new Telegraf(token);
-  const stage = new Scenes.Stage([incomeExpenseWizard, transferWizard, ocrConfirmWizard, autoTxAddWizard, autoTxPickWizard]);
+  const stage = new Scenes.Stage([
+    incomeExpenseWizard,
+    transferWizard,
+    ocrConfirmWizard,
+    autoTxAddWizard,
+    autoTxPickWizard
+  ]);
 
   bot.use(session());
   bot.use(stage.middleware());
@@ -476,82 +480,15 @@ function createBot(token) {
     const list = await listAutoTransactions();
     const lines = list.length
       ? list.map(a => `${a.active ? "🟢" : "⏸️"} ${a.description} — Rp ${formatIDR(a.amount)} → ${a.category} (${a.account}), day ${a.dayOfMonth}`)
-        : ["No auto-transactions yet."];
-      await ctx.reply(lines.join("\n"), Markup.keyboard([[AUTO_ADD], [AUTO_DELETE, AUTO_TOGGLE], [AUTO_BACK]]).resize());
+      : ["No auto-transactions yet."];
+    await ctx.reply(lines.join("\n"), Markup.keyboard([[AUTO_ADD], [AUTO_DELETE, AUTO_TOGGLE], [AUTO_BACK]]).resize());
   });
-
   bot.hears(AUTO_ADD, ctx => ctx.scene.enter("AUTO_TX_ADD_WIZARD"));
   bot.hears(AUTO_DELETE, ctx => ctx.scene.enter("AUTO_TX_PICK_WIZARD", { action: "delete" }));
   bot.hears(AUTO_TOGGLE, ctx => ctx.scene.enter("AUTO_TX_PICK_WIZARD", { action: "toggle" }));
   bot.hears(AUTO_BACK, ctx => ctx.reply("Main menu", mainKeyboard));
 
-
-  bot.on("document", async ctx => {
-  const doc = ctx.message.document;
-  if (doc.mime_type !== "application/pdf") {
-    return ctx.reply("I can only read PDF documents right now (send a photo for image receipts).", mainKeyboard);
-  }
-
-  logger.info(`PDF received from user ${ctx.from?.id}: ${doc.file_name}`);
-  const fileLink = await ctx.telegram.getFileLink(doc.file_id);
-  const [accounts, expenseCategories] = await Promise.all([getAccounts(), getExpenseCategories()]);
-
-  let extracted = null;
-  try {
-    const buffer = await downloadBuffer(fileLink.href);
-    extracted = await extractReceiptDataFromPDF(buffer, accounts);
-  } catch (err) {
-    logger.error("PDF OCR failed:", err);
-  }
-
-  const matchedAccount = extracted?.account
-    ? accounts.find(a => a.toLowerCase() === extracted.account.toLowerCase())
-    : null;
-  const guessedCategory = extracted?.description
-    ? guessTransaction(extracted.description, [], expenseCategories).category
-    : null;
-
-  if (extracted?.amount && matchedAccount && guessedCategory) {
-    logger.info("PDF OCR: full confident match", { amount: extracted.amount, description: extracted.description, category: guessedCategory, account: matchedAccount });
-    await ctx.scene.enter("OCR_CONFIRM_WIZARD", {
-      amount: extracted.amount,
-      description: extracted.description || "",
-      category: guessedCategory,
-      account: matchedAccount
-    });
-    const summary = [
-      "📄 <b>Read from PDF:</b>",
-      `Amount: Rp ${formatIDR(extracted.amount)}`,
-      `Merchant: ${extracted.description || "-"}`,
-      `Category: ${guessedCategory}`,
-      `Account: ${matchedAccount}`,
-      "",
-      "Is this correct?"
-    ].join("\n");
-    await ctx.replyWithHTML(summary, Markup.keyboard([[CONFIRM], [EDIT], [CANCEL]]).resize());
-    return;
-  }
-
-  logger.info("PDF OCR: partial or no data, entering wizard with detected fields", extracted);
-  if (extracted?.amount || extracted?.description || matchedAccount) {
-    await ctx.reply("📄 Detected from PDF — confirm or override each field below.");
-  } else {
-    await ctx.reply(
-      extracted
-        ? "Couldn't read data from that PDF — it might be a scanned image rather than a text PDF. Enter the details manually."
-        : "Couldn't process that PDF — enter the details manually."
-    );
-  }
-  await ctx.scene.enter("INCOME_EXPENSE_WIZARD", {
-    type: "expense",
-    detectedAmount: extracted?.amount || null,
-    detectedDescription: extracted?.description || null,
-    detectedAccount: matchedAccount || null,
-    detectedCategory: guessedCategory || null
-  });
-});
-
-  // Photo -> OCR -> confirm (if fully confident) or wizard with quick-pick buttons
+  // ---- Photo receipt: AI first, local OCR as fallback ----
   bot.on("photo", async ctx => {
     logger.info(`Photo received from user ${ctx.from?.id}`);
     const photos = ctx.message.photo;
@@ -559,39 +496,43 @@ function createBot(token) {
     const fileLink = await ctx.telegram.getFileLink(fileId);
 
     const [accounts, expenseCategories] = await Promise.all([getAccounts(), getExpenseCategories()]);
+    const buffer = await downloadBuffer(fileLink.href);
 
     let extracted = null;
-    try {
-      extracted = await extractReceiptData(fileLink.href, accounts);
-    } catch (err) {
-      logger.error("OCR failed:", err);
+    let matchedAccount = null;
+    let category = null;
+
+    const aiResult = await analyzeReceiptWithAI(buffer, "image/jpeg", { accounts, expenseCategories });
+
+    if (aiResult) {
+      logger.info("Photo: using AI extraction", aiResult);
+      extracted = { amount: aiResult.amount, description: aiResult.description || "" };
+      matchedAccount = aiResult.account ? accounts.find(a => a.toLowerCase() === aiResult.account.toLowerCase()) : null;
+      category = expenseCategories.find(c => c.toLowerCase() === (aiResult.category || "").toLowerCase()) || null;
+    } else {
+      logger.info("Photo: AI unavailable/failed, falling back to local OCR");
+      try {
+        extracted = await extractReceiptData(fileLink.href, accounts);
+      } catch (err) {
+        logger.error("Local OCR failed:", err);
+      }
+      matchedAccount = extracted?.account ? accounts.find(a => a.toLowerCase() === extracted.account.toLowerCase()) : null;
+      category = extracted?.description ? guessTransaction(extracted.description, [], expenseCategories).category : null;
     }
 
-    const matchedAccount = extracted?.account
-      ? accounts.find(a => a.toLowerCase() === extracted.account.toLowerCase())
-      : null;
-    const guessedCategory = extracted?.description
-      ? guessTransaction(extracted.description, [], expenseCategories).category
-      : null;
-
-    if (extracted?.amount && matchedAccount && guessedCategory) {
-      logger.info("OCR: full confident match", {
-        amount: extracted.amount,
-        description: extracted.description,
-        category: guessedCategory,
-        account: matchedAccount
-      });
+    if (extracted?.amount && matchedAccount && category) {
+      logger.info("Receipt: full confident match", { amount: extracted.amount, description: extracted.description, category, account: matchedAccount });
       await ctx.scene.enter("OCR_CONFIRM_WIZARD", {
         amount: extracted.amount,
         description: extracted.description || "",
-        category: guessedCategory,
+        category,
         account: matchedAccount
       });
       const summary = [
         "📷 <b>Read from receipt:</b>",
         `Amount: Rp ${formatIDR(extracted.amount)}`,
         `Merchant: ${extracted.description || "-"}`,
-        `Category: ${guessedCategory}`,
+        `Category: ${category}`,
         `Account: ${matchedAccount}`,
         "",
         "Is this correct?"
@@ -600,12 +541,12 @@ function createBot(token) {
       return;
     }
 
-    logger.info("OCR: partial or no data, entering wizard with detected fields", extracted);
+    logger.info("Receipt: partial or no data, entering wizard with detected fields", extracted);
     if (extracted?.amount || extracted?.description || matchedAccount) {
       await ctx.reply("📷 Detected from receipt — confirm or override each field below.");
     } else {
       await ctx.reply(
-        extracted ? "Couldn't read this receipt clearly — enter the details manually." : "OCR isn't wired up yet — enter the amount manually."
+        extracted ? "Couldn't read this receipt clearly — enter the details manually." : "Couldn't process that photo — enter the details manually."
       );
     }
     await ctx.scene.enter("INCOME_EXPENSE_WIZARD", {
@@ -613,12 +554,85 @@ function createBot(token) {
       detectedAmount: extracted?.amount || null,
       detectedDescription: extracted?.description || null,
       detectedAccount: matchedAccount || null,
-      detectedCategory: guessedCategory || null
+      detectedCategory: category || null
     });
   });
 
-  // Free-text quick add: strict "desc amount account" shorthand first (free),
-  // natural-language sentences fall back to Gemini (only if GEMINI_API_KEY is set)
+  // ---- PDF receipt: AI first, local text-extraction as fallback ----
+  bot.on("document", async ctx => {
+    const doc = ctx.message.document;
+    if (doc.mime_type !== "application/pdf") {
+      return ctx.reply("I can only read PDF documents right now (send a photo for image receipts).", mainKeyboard);
+    }
+
+    logger.info(`PDF received from user ${ctx.from?.id}: ${doc.file_name}`);
+    const fileLink = await ctx.telegram.getFileLink(doc.file_id);
+    const [accounts, expenseCategories] = await Promise.all([getAccounts(), getExpenseCategories()]);
+    const buffer = await downloadBuffer(fileLink.href);
+
+    let extracted = null;
+    let matchedAccount = null;
+    let category = null;
+
+    const aiResult = await analyzeReceiptWithAI(buffer, "application/pdf", { accounts, expenseCategories });
+
+    if (aiResult) {
+      logger.info("PDF: using AI extraction", aiResult);
+      extracted = { amount: aiResult.amount, description: aiResult.description || "" };
+      matchedAccount = aiResult.account ? accounts.find(a => a.toLowerCase() === aiResult.account.toLowerCase()) : null;
+      category = expenseCategories.find(c => c.toLowerCase() === (aiResult.category || "").toLowerCase()) || null;
+    } else {
+      logger.info("PDF: AI unavailable/failed, falling back to local text extraction");
+      try {
+        extracted = await extractReceiptDataFromPDF(buffer, accounts);
+      } catch (err) {
+        logger.error("Local PDF OCR failed:", err);
+      }
+      matchedAccount = extracted?.account ? accounts.find(a => a.toLowerCase() === extracted.account.toLowerCase()) : null;
+      category = extracted?.description ? guessTransaction(extracted.description, [], expenseCategories).category : null;
+    }
+
+    if (extracted?.amount && matchedAccount && category) {
+      logger.info("PDF: full confident match", { amount: extracted.amount, description: extracted.description, category, account: matchedAccount });
+      await ctx.scene.enter("OCR_CONFIRM_WIZARD", {
+        amount: extracted.amount,
+        description: extracted.description || "",
+        category,
+        account: matchedAccount
+      });
+      const summary = [
+        "📄 <b>Read from PDF:</b>",
+        `Amount: Rp ${formatIDR(extracted.amount)}`,
+        `Merchant: ${extracted.description || "-"}`,
+        `Category: ${category}`,
+        `Account: ${matchedAccount}`,
+        "",
+        "Is this correct?"
+      ].join("\n");
+      await ctx.replyWithHTML(summary, Markup.keyboard([[CONFIRM], [EDIT], [CANCEL]]).resize());
+      return;
+    }
+
+    logger.info("PDF: partial or no data, entering wizard with detected fields", extracted);
+    if (extracted?.amount || extracted?.description || matchedAccount) {
+      await ctx.reply("📄 Detected from PDF — confirm or override each field below.");
+    } else {
+      await ctx.reply(
+        extracted
+          ? "Couldn't read data from that PDF — enter the details manually."
+          : "Couldn't process that PDF — enter the details manually."
+      );
+    }
+    await ctx.scene.enter("INCOME_EXPENSE_WIZARD", {
+      type: "expense",
+      detectedAmount: extracted?.amount || null,
+      detectedDescription: extracted?.description || null,
+      detectedAccount: matchedAccount || null,
+      detectedCategory: category || null
+    });
+  });
+
+  // ---- Free-text quick add: strict shorthand first (free), Gemini fallback for full sentences ----
   bot.on("text", async ctx => {
     const text = ctx.message.text.trim();
     logger.info(`Text from user ${ctx.from?.id}:`, text);
@@ -654,14 +668,14 @@ function createBot(token) {
     }
 
     logger.info("Shorthand didn't match — trying AI parse");
-    let aiResult = null;
+    let aiTextResult = null;
     try {
-      aiResult = await parseWithAI(text, { accounts, incomeCategories, expenseCategories });
+      aiTextResult = await parseWithAI(text, { accounts, incomeCategories, expenseCategories });
     } catch (err) {
-      logger.error("AI parse threw unexpectedly:", err);
+      logger.error("AI text parse threw unexpectedly:", err);
     }
 
-    if (!aiResult) {
+    if (!aiTextResult) {
       logger.warn("Could not parse message via shorthand or AI:", text);
       return ctx.reply(
         'Use the buttons below, or type: description amount account (e.g. "mcd 10000 cash")',
@@ -670,14 +684,14 @@ function createBot(token) {
     }
 
     const signed = await insertTransaction({
-      description: aiResult.description,
-      category: aiResult.category,
-      amount: aiResult.amount,
-      account: aiResult.account,
-      type: aiResult.type
+      description: aiTextResult.description,
+      category: aiTextResult.category,
+      amount: aiTextResult.amount,
+      account: aiTextResult.account,
+      type: aiTextResult.type
     });
-    logger.info("AI transaction inserted:", aiResult);
-    await ctx.reply(`👍 Successfully added ${signed}.0 to ${aiResult.category} from ${aiResult.account}!`, mainKeyboard);
+    logger.info("AI transaction inserted:", aiTextResult);
+    await ctx.reply(`👍 Successfully added ${signed}.0 to ${aiTextResult.category} from ${aiTextResult.account}!`, mainKeyboard);
   });
 
   return bot;
