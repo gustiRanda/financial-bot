@@ -154,11 +154,85 @@ async function getAvailableSummary() {
   };
 }
 
+async function getBudgetSummary(targetDate) {
+  // targetDate: a dayjs object for any day within the month you want to view
+  const sheets = getSheets();
+  const spreadsheetId = process.env.GOOGLE_SHEET_ID;
+
+  // 1. Snapshot B1 exactly as it's currently typed (e.g. "9/10/2026"), so we
+  //    can restore it precisely afterward, same format the user themself typed.
+  const originalRes = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: "Budget!B1"
+  });
+  const originalValue = originalRes.data.values?.[0]?.[0] ?? null;
+
+  // 2. Write the target month in ISO format — parses correctly as a date
+  //    regardless of the sheet's locale (same fix as the Transactions date bug).
+  await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range: "Budget!B1",
+    valueInputOption: "USER_ENTERED",
+    resource: { values: [[targetDate.format("YYYY-MM-DD")]] }
+  });
+
+  // 3. Read the now-recalculated sheet, raw numbers (not "Rp1,234" strings).
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: "Budget!A1:D45",
+    valueRenderOption: "UNFORMATTED_VALUE"
+  });
+  const rows = res.data.values || [];
+
+  const label = r => ((rows[r] || [])[0] || "").toString().trim();
+  const plan = r => Number((rows[r] || [])[1]) || 0;
+  const actual = r => Number((rows[r] || [])[2]) || 0;
+  const diff = r => Number((rows[r] || [])[3]) || 0;
+
+  const income = [];
+  const expenses = [];
+  let totalIncome = null, totalExpenses = null, profit = null, section = null;
+
+  for (let r = 1; r < rows.length; r++) {
+    const name = label(r);
+    if (!name) continue;
+    if (/^income$/i.test(name)) { section = "income"; continue; }
+    if (/^expenses$/i.test(name)) { section = "expenses"; continue; }
+    if (/^total income$/i.test(name)) { totalIncome = { plan: plan(r), actual: actual(r), diff: diff(r) }; continue; }
+    if (/^total expenses$/i.test(name)) { totalExpenses = { plan: plan(r), actual: actual(r), diff: diff(r) }; continue; }
+    if (/^profit$/i.test(name)) { profit = diff(r) || actual(r); continue; }
+    const entry = { name, plan: plan(r), actual: actual(r), diff: diff(r) };
+    if (entry.plan === 0 && entry.actual === 0) continue;
+    if (section === "income") income.push(entry);
+    else if (section === "expenses") expenses.push(entry);
+  }
+
+  // 4. Put B1 back exactly how it was, as if we were never there.
+  if (originalValue !== null) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: "Budget!B1",
+      valueInputOption: "USER_ENTERED",
+      resource: { values: [[originalValue]] }
+    });
+  }
+
+  return {
+    monthLabel: targetDate.format("MMMM YYYY"),
+    income,
+    expenses,
+    totalIncome,
+    totalExpenses,
+    profit
+  };
+}
+
 module.exports = {
   insertTransaction,
   insertTransfer,
   getExpenseCategories,
   getIncomeCategories,
   getAccounts,
-  getAvailableSummary
+  getAvailableSummary,
+  getBudgetSummary
 };

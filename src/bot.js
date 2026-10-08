@@ -7,7 +7,8 @@ const {
   getExpenseCategories,
   getIncomeCategories,
   getAccounts,
-  getAvailableSummary
+  getAvailableSummary,
+  getBudgetSummary
 } = require("./sheets");
 
 const { extractReceiptData } = require("./ocr");
@@ -17,6 +18,7 @@ const { parseMessage } = require("./parser");
 const { guessTransaction } = require("./categorizer");
 const { parseWithAI } = require("./ai");
 const { listAutoTransactions, addAutoTransaction, deleteAutoTransaction, setActive } = require("./autotx");
+const dayjs = require("dayjs"); // add if not already imported
 const logger = require("./logger");
 
 const CANCEL = "❌ Cancel";
@@ -24,16 +26,21 @@ const NO_DESCRIPTION = "⏭ No description";
 const NO_FEE = "🆓 No fee";
 const CONFIRM = "✅ Confirm & Add";
 const EDIT = "✏️ Edit details";
-const AUTO_MENU = "🔁📅 Auto";
+const AUTO_MENU = "🔁 📅 Auto";
 const AUTO_ADD = "➕ Add auto-transaction";
 const AUTO_DELETE = "🗑 Delete one";
 const AUTO_TOGGLE = "⏸️▶️ Toggle active";
 const AUTO_BACK = "⬅️ Back";
+const BUDGET_VIEW = "📊 Budget";
+const PREV_MONTH = "◀ Previous";
+const NEXT_MONTH = "Next ▶";
+const BUDGET_BACK = "⬅️ Back";
 
 const mainKeyboard = Markup.keyboard([
   ["➕ Income", "➖ Expense"],
   ["🔁 Transfer"],
   ["💰 Available"],
+  [BUDGET_VIEW],
   [AUTO_MENU]
 ]).resize();
 
@@ -61,6 +68,23 @@ async function downloadBuffer(url) {
   const arrayBuffer = await res.arrayBuffer();
   return Buffer.from(arrayBuffer);
 }
+
+ function renderBudget(summary) {
+    const allRows = [...summary.income, ...summary.expenses];
+    const nameWidth = Math.max(...allRows.map(r => r.name.length), 10) + 2;
+    const fmtRow = r =>
+      `${r.name.padEnd(nameWidth)}${formatIDR(r.plan).padStart(12)} ${formatIDR(r.actual).padStart(12)} ${(r.diff < 0 ? "-Rp" + formatIDR(Math.abs(r.diff)) : "Rp" + formatIDR(r.diff)).padStart(13)}`;
+
+    const lines = [`${"".padEnd(nameWidth)}${"Plan".padStart(12)} ${"Actual".padStart(12)} ${"Diff".padStart(13)}`, "INCOME"];
+    summary.income.forEach(r => lines.push(fmtRow(r)));
+    if (summary.totalIncome) lines.push(fmtRow({ name: "Total income", ...summary.totalIncome }));
+    lines.push("", "EXPENSES");
+    summary.expenses.forEach(r => lines.push(fmtRow(r)));
+    if (summary.totalExpenses) lines.push(fmtRow({ name: "Total expenses", ...summary.totalExpenses }));
+    if (summary.profit !== null) lines.push("", `Profit: Rp ${formatIDR(summary.profit)}`);
+
+    return `<b>📊 Budget — ${summary.monthLabel}</b>\n<pre>${lines.join("\n")}</pre>`;
+  }
 
 // ---------- Income / Expense wizard ----------
 // Every step supports a "detected*" value in scene.state (from OCR/AI). If present,
@@ -314,6 +338,39 @@ const ocrConfirmStep = async ctx => {
 
 const ocrConfirmWizard = new Scenes.WizardScene("OCR_CONFIRM_WIZARD", ocrConfirmStep);
 
+// ---------- budget view wizards ----------
+
+const budgetNavStep = async ctx => {
+  const text = ctx.message?.text?.trim();
+  if (!text) return;
+  if (text === BUDGET_BACK) {
+    await ctx.reply("Main menu", mainKeyboard);
+    return ctx.scene.leave();
+  }
+  let { offset } = ctx.scene.state;
+  if (text === PREV_MONTH) offset -= 1;
+  else if (text === NEXT_MONTH) offset += 1;
+  else return;
+  ctx.scene.state.offset = offset;
+
+  const targetDate = dayjs().add(offset, "month").startOf("month");
+  logger.info(`Budget view: offset ${offset} (${targetDate.format("YYYY-MM")})`);
+  const summary = await getBudgetSummary(targetDate);
+
+  await ctx.replyWithHTML(renderBudget(summary), Markup.keyboard([[PREV_MONTH, NEXT_MONTH], [BUDGET_BACK]]).resize());
+};
+
+const budgetViewWizard = new Scenes.WizardScene(
+  "BUDGET_VIEW_WIZARD",
+  async ctx => {
+    ctx.scene.state.offset = 0;
+    const summary = await getBudgetSummary(dayjs().startOf("month"));
+    await ctx.replyWithHTML(renderBudget(summary), Markup.keyboard([[PREV_MONTH, NEXT_MONTH], [BUDGET_BACK]]).resize());
+    return ctx.wizard.next();
+  },
+  budgetNavStep
+);
+
 // ---------- Auto-transaction wizards ----------
 
 const autoTypeStep = async ctx => {
@@ -444,7 +501,8 @@ function createBot(token) {
     transferWizard,
     ocrConfirmWizard,
     autoTxAddWizard,
-    autoTxPickWizard
+    autoTxPickWizard,
+    budgetViewWizard 
   ]);
 
   bot.use(session());
@@ -475,6 +533,8 @@ function createBot(token) {
     const message = `<b>💰 Financial Summary</b>\n<pre>${summaryBlock}\n\nACCOUNTS\n${accountLines.join("\n")}</pre>`;
     await ctx.replyWithHTML(message, mainKeyboard);
   });
+
+  bot.hears(BUDGET_VIEW, ctx => ctx.scene.enter("BUDGET_VIEW_WIZARD"));
 
   bot.hears(AUTO_MENU, async ctx => {
     const list = await listAutoTransactions();
@@ -693,6 +753,8 @@ function createBot(token) {
     logger.info("AI transaction inserted:", aiTextResult);
     await ctx.reply(`👍 Successfully added ${signed}.0 to ${aiTextResult.category} from ${aiTextResult.account}!`, mainKeyboard);
   });
+
+ 
 
   return bot;
 }
