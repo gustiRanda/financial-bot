@@ -15,6 +15,7 @@
     "@google-cloud/vision": "^6.0.0",
     "@google/genai": "^2.18.0",
     "@google/generative-ai": "^0.24.1",
+    "@upstash/redis": "^1.41.0",
     "axios": "^1.19.0",
     "dayjs": "^1.11.23",
     "dotenv": "^17.4.2",

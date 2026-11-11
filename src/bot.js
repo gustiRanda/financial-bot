@@ -1,4 +1,4 @@
-// bot.js
+// bot.js — Vercel (webhook) version
 const { Telegraf, Scenes, session, Markup } = require("telegraf");
 
 const {
@@ -11,14 +11,14 @@ const {
   getBudgetSummary
 } = require("./sheets");
 
-const { extractReceiptData } = require("./ocr");
 const { extractReceiptDataFromPDF } = require("./pdfOcr");
 const { analyzeReceiptWithAI } = require("./aiReceipt");
 const { parseMessage } = require("./parser");
 const { guessTransaction } = require("./categorizer");
 const { parseWithAI } = require("./ai");
 const { listAutoTransactions, addAutoTransaction, deleteAutoTransaction, setActive } = require("./autotx");
-const dayjs = require("dayjs"); // add if not already imported
+const sessionStore = require("./sessionStore");
+const { now } = require("./time");
 const logger = require("./logger");
 
 const CANCEL = "❌ Cancel";
@@ -26,7 +26,7 @@ const NO_DESCRIPTION = "⏭ No description";
 const NO_FEE = "🆓 No fee";
 const CONFIRM = "✅ Confirm & Add";
 const EDIT = "✏️ Edit details";
-const AUTO_MENU = "🔁 📅 Auto";
+const AUTO_MENU = "🔁📅 Auto";
 const AUTO_ADD = "➕ Add auto-transaction";
 const AUTO_DELETE = "🗑 Delete one";
 const AUTO_TOGGLE = "⏸️▶️ Toggle active";
@@ -39,8 +39,7 @@ const BUDGET_BACK = "⬅️ Back";
 const mainKeyboard = Markup.keyboard([
   ["➕ Income", "➖ Expense"],
   ["🔁 Transfer"],
-  ["💰 Available"],
-  [BUDGET_VIEW],
+  ["💰 Available", BUDGET_VIEW],
   [AUTO_MENU]
 ]).resize();
 
@@ -69,25 +68,67 @@ async function downloadBuffer(url) {
   return Buffer.from(arrayBuffer);
 }
 
- function renderBudget(summary) {
-    const allRows = [...summary.income, ...summary.expenses];
-    const nameWidth = Math.max(...allRows.map(r => r.name.length), 10) + 2;
-    const fmtRow = r =>
-      `${r.name.padEnd(nameWidth)}${formatIDR(r.plan).padStart(12)} ${formatIDR(r.actual).padStart(12)} ${(r.diff < 0 ? "-Rp" + formatIDR(Math.abs(r.diff)) : "Rp" + formatIDR(r.diff)).padStart(13)}`;
+// ---------- Budget rendering ----------
 
-    const lines = [`${"".padEnd(nameWidth)}${"Plan".padStart(12)} ${"Actual".padStart(12)} ${"Diff".padStart(13)}`, "INCOME"];
-    summary.income.forEach(r => lines.push(fmtRow(r)));
-    if (summary.totalIncome) lines.push(fmtRow({ name: "Total income", ...summary.totalIncome }));
-    lines.push("", "EXPENSES");
-    summary.expenses.forEach(r => lines.push(fmtRow(r)));
-    if (summary.totalExpenses) lines.push(fmtRow({ name: "Total expenses", ...summary.totalExpenses }));
-    if (summary.profit !== null) lines.push("", `Profit: Rp ${formatIDR(summary.profit)}`);
+function truncateName(name, width) {
+  return name.length > width ? name.slice(0, width - 1) + "…" : name.padEnd(width);
+}
 
-    return `<b>📊 Budget — ${summary.monthLabel}</b>\n<pre>${lines.join("\n")}</pre>`;
+function statusSymbol(r) {
+  if (r.actual === 0) return "";
+  if (r.diff > 0) return "🟢";
+  if (r.diff < 0) return "🔴";
+  return "⚪";
+}
+
+function renderBudget(summary) {
+  const NAME_W = 12;
+  const AMT_W = 10;
+
+  function tableRows(rows) {
+    return rows
+      .filter(r => r.actual !== 0)
+      .map(r => `${truncateName(r.name, NAME_W)}${formatIDR(r.actual).padStart(AMT_W)} ${statusSymbol(r)}`)
+      .join("\n");
   }
 
+  function notYet(rows) {
+    const names = rows.filter(r => r.actual === 0 && r.plan !== 0).map(r => r.name);
+    return names.length ? `<i>Not yet recorded (${names.length}): ${names.join(", ")}</i>` : "";
+  }
+
+  const header = `${"".padEnd(NAME_W)}${"Actual".padStart(AMT_W)}`;
+
+  const block = [
+    "INCOME",
+    header,
+    tableRows(summary.income) || "(none yet)",
+    summary.totalIncome ? `${"TOTAL".padEnd(NAME_W)}${formatIDR(summary.totalIncome.actual).padStart(AMT_W)}` : "",
+    "",
+    "EXPENSES",
+    header,
+    tableRows(summary.expenses) || "(none yet)",
+    summary.totalExpenses ? `${"TOTAL".padEnd(NAME_W)}${formatIDR(summary.totalExpenses.actual).padStart(AMT_W)}` : ""
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const lines = [`<b>📊 Budget — ${summary.monthLabel}</b>`, `<pre>${block}</pre>`];
+
+  const incomeFootnote = notYet(summary.income);
+  const expenseFootnote = notYet(summary.expenses);
+  if (incomeFootnote) lines.push(incomeFootnote);
+  if (expenseFootnote) lines.push(expenseFootnote);
+
+  if (summary.profit !== null) {
+    lines.push(`<b>Profit:</b> Rp ${formatIDR(summary.profit)}`);
+  }
+
+  return lines.join("\n");
+}
+
 // ---------- Income / Expense wizard ----------
-// Every step supports a "detected*" value in scene.state (from OCR/AI). If present,
+// Every step supports a "detected*" value in scene.state (from AI/OCR). If present,
 // a "✅ Use: ..." button is offered, but the user can always type their own value.
 
 const enterAmountStep = async ctx => {
@@ -304,7 +345,7 @@ const transferWizard = new Scenes.WizardScene(
   transferDescriptionStep
 );
 
-// ---------- OCR/AI confirm wizard (only used when we got EVERYTHING confidently) ----------
+// ---------- Receipt confirm wizard (only used when we got EVERYTHING confidently) ----------
 
 const ocrConfirmStep = async ctx => {
   const text = ctx.message?.text?.trim();
@@ -337,39 +378,6 @@ const ocrConfirmStep = async ctx => {
 };
 
 const ocrConfirmWizard = new Scenes.WizardScene("OCR_CONFIRM_WIZARD", ocrConfirmStep);
-
-// ---------- budget view wizards ----------
-
-const budgetNavStep = async ctx => {
-  const text = ctx.message?.text?.trim();
-  if (!text) return;
-  if (text === BUDGET_BACK) {
-    await ctx.reply("Main menu", mainKeyboard);
-    return ctx.scene.leave();
-  }
-  let { offset } = ctx.scene.state;
-  if (text === PREV_MONTH) offset -= 1;
-  else if (text === NEXT_MONTH) offset += 1;
-  else return;
-  ctx.scene.state.offset = offset;
-
-  const targetDate = dayjs().add(offset, "month").startOf("month");
-  logger.info(`Budget view: offset ${offset} (${targetDate.format("YYYY-MM")})`);
-  const summary = await getBudgetSummary(targetDate);
-
-  await ctx.replyWithHTML(renderBudget(summary), Markup.keyboard([[PREV_MONTH, NEXT_MONTH], [BUDGET_BACK]]).resize());
-};
-
-const budgetViewWizard = new Scenes.WizardScene(
-  "BUDGET_VIEW_WIZARD",
-  async ctx => {
-    ctx.scene.state.offset = 0;
-    const summary = await getBudgetSummary(dayjs().startOf("month"));
-    await ctx.replyWithHTML(renderBudget(summary), Markup.keyboard([[PREV_MONTH, NEXT_MONTH], [BUDGET_BACK]]).resize());
-    return ctx.wizard.next();
-  },
-  budgetNavStep
-);
 
 // ---------- Auto-transaction wizards ----------
 
@@ -492,20 +500,67 @@ const autoTxPickWizard = new Scenes.WizardScene(
   autoPickStep
 );
 
+// ---------- Budget view wizard ----------
+
+const budgetKeyboard = Markup.keyboard([[PREV_MONTH, NEXT_MONTH], [BUDGET_BACK]]).resize();
+
+const budgetNavStep = async ctx => {
+  const text = ctx.message?.text?.trim();
+  if (!text) return;
+  if (text === BUDGET_BACK) {
+    await ctx.reply("Main menu", mainKeyboard);
+    return ctx.scene.leave();
+  }
+  let { offset } = ctx.scene.state;
+  if (text === PREV_MONTH) offset -= 1;
+  else if (text === NEXT_MONTH) offset += 1;
+  else return;
+  ctx.scene.state.offset = offset;
+
+  const targetDate = now().add(offset, "month").startOf("month");
+  logger.info(`Budget view: offset ${offset} (${targetDate.format("YYYY-MM")})`);
+  const summary = await getBudgetSummary(targetDate);
+
+  await ctx.replyWithHTML(renderBudget(summary), budgetKeyboard);
+};
+
+const budgetViewWizard = new Scenes.WizardScene(
+  "BUDGET_VIEW_WIZARD",
+  async ctx => {
+    ctx.scene.state.offset = 0;
+    const targetDate = now().startOf("month");
+    logger.info(`Budget view: opening current month (${targetDate.format("YYYY-MM")})`);
+    const summary = await getBudgetSummary(targetDate);
+    await ctx.replyWithHTML(renderBudget(summary), budgetKeyboard);
+    return ctx.wizard.next();
+  },
+  budgetNavStep
+);
+
 // ---------- Bot ----------
 
 function createBot(token) {
   const bot = new Telegraf(token);
+
+  // Owner-only guard: the webhook URL is public, so ignore anyone but you.
+  // If OWNER_USER_ID isn't set, everyone is allowed (set it!).
+  const owner = process.env.OWNER_USER_ID;
+  bot.use((ctx, next) => {
+    if (!owner || String(ctx.from?.id) === owner) return next();
+    logger.warn(`Blocked update from non-owner user ${ctx.from?.id}`);
+  });
+
   const stage = new Scenes.Stage([
     incomeExpenseWizard,
     transferWizard,
     ocrConfirmWizard,
     autoTxAddWizard,
     autoTxPickWizard,
-    budgetViewWizard 
+    budgetViewWizard
   ]);
 
-  bot.use(session());
+  // Sessions live in Redis (Upstash) so wizard state survives between serverless invocations.
+  bot.use(session({ store: sessionStore }));
   bot.use(stage.middleware());
 
   bot.start(ctx => ctx.reply("Ready to track your finances.", mainKeyboard));
@@ -513,6 +568,7 @@ function createBot(token) {
   bot.hears("➕ Income", ctx => ctx.scene.enter("INCOME_EXPENSE_WIZARD", { type: "income" }));
   bot.hears("➖ Expense", ctx => ctx.scene.enter("INCOME_EXPENSE_WIZARD", { type: "expense" }));
   bot.hears("🔁 Transfer", ctx => ctx.scene.enter("TRANSFER_WIZARD"));
+  bot.hears(BUDGET_VIEW, ctx => ctx.scene.enter("BUDGET_VIEW_WIZARD"));
 
   bot.hears("💰 Available", async ctx => {
     const s = await getAvailableSummary();
@@ -534,8 +590,6 @@ function createBot(token) {
     await ctx.replyWithHTML(message, mainKeyboard);
   });
 
-  bot.hears(BUDGET_VIEW, ctx => ctx.scene.enter("BUDGET_VIEW_WIZARD"));
-
   bot.hears(AUTO_MENU, async ctx => {
     const list = await listAutoTransactions();
     const lines = list.length
@@ -548,7 +602,7 @@ function createBot(token) {
   bot.hears(AUTO_TOGGLE, ctx => ctx.scene.enter("AUTO_TX_PICK_WIZARD", { action: "toggle" }));
   bot.hears(AUTO_BACK, ctx => ctx.reply("Main menu", mainKeyboard));
 
-  // ---- Photo receipt: AI first, local OCR as fallback ----
+  // ---- Photo receipt: Gemini only (no local Tesseract on Vercel) ----
   bot.on("photo", async ctx => {
     logger.info(`Photo received from user ${ctx.from?.id}`);
     const photos = ctx.message.photo;
@@ -570,14 +624,7 @@ function createBot(token) {
       matchedAccount = aiResult.account ? accounts.find(a => a.toLowerCase() === aiResult.account.toLowerCase()) : null;
       category = expenseCategories.find(c => c.toLowerCase() === (aiResult.category || "").toLowerCase()) || null;
     } else {
-      logger.info("Photo: AI unavailable/failed, falling back to local OCR");
-      try {
-        extracted = await extractReceiptData(fileLink.href, accounts);
-      } catch (err) {
-        logger.error("Local OCR failed:", err);
-      }
-      matchedAccount = extracted?.account ? accounts.find(a => a.toLowerCase() === extracted.account.toLowerCase()) : null;
-      category = extracted?.description ? guessTransaction(extracted.description, [], expenseCategories).category : null;
+      logger.warn("Photo: AI unavailable/failed — no local OCR on Vercel, going to manual entry");
     }
 
     if (extracted?.amount && matchedAccount && category) {
@@ -605,9 +652,7 @@ function createBot(token) {
     if (extracted?.amount || extracted?.description || matchedAccount) {
       await ctx.reply("📷 Detected from receipt — confirm or override each field below.");
     } else {
-      await ctx.reply(
-        extracted ? "Couldn't read this receipt clearly — enter the details manually." : "Couldn't process that photo — enter the details manually."
-      );
+      await ctx.reply("Couldn't read that photo (the AI may be busy) — enter the details manually.");
     }
     await ctx.scene.enter("INCOME_EXPENSE_WIZARD", {
       type: "expense",
@@ -618,7 +663,7 @@ function createBot(token) {
     });
   });
 
-  // ---- PDF receipt: AI first, local text-extraction as fallback ----
+  // ---- PDF receipt: AI first, local pdf-parse text extraction as fallback ----
   bot.on("document", async ctx => {
     const doc = ctx.message.document;
     if (doc.mime_type !== "application/pdf") {
@@ -753,8 +798,6 @@ function createBot(token) {
     logger.info("AI transaction inserted:", aiTextResult);
     await ctx.reply(`👍 Successfully added ${signed}.0 to ${aiTextResult.category} from ${aiTextResult.account}!`, mainKeyboard);
   });
-
- 
 
   return bot;
 }

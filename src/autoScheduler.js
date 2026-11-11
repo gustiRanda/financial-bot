@@ -1,15 +1,21 @@
 const cron = require("node-cron");
-const dayjs = require("dayjs");
 const logger = require("./logger");
 const { listAutoTransactions, markRun } = require("./autotx");
 const { insertTransaction } = require("./sheets");
+const { now } = require("./time");
 
 function formatIDR(n) {
   return new Intl.NumberFormat("id-ID").format(Math.round(n));
 }
 
+// Checks every recurring rule and inserts the ones due today.
+// Used by: the Vercel cron endpoint (api/cron/auto-tx.js), test-auto.js, and the
+// local node-cron scheduler below.
+//   opts.simulatedDate  dayjs object to pretend "today" is something else (testing)
+//   opts.dryRun         log what would happen, write nothing, send nothing
+//   opts.force          ignore the "already ran today" guard
 async function runAutoTransactionCheck(bot, opts = {}) {
-  const today = opts.simulatedDate || dayjs();
+  const today = opts.simulatedDate || now();
   const dryRun = !!opts.dryRun;
   const force = !!opts.force;
 
@@ -67,6 +73,8 @@ async function runAutoTransactionCheck(bot, opts = {}) {
   }
 }
 
+// Only used when running as a long-lived process (phone/VPS). On Vercel nothing
+// calls this — vercel.json triggers api/cron/auto-tx.js instead.
 function startAutoTransactionScheduler(bot) {
   cron.schedule("0 7 * * *", () => runAutoTransactionCheck(bot), { timezone: "Asia/Jakarta" });
   logger.info("Auto-transaction scheduler started (daily 07:00 Asia/Jakarta)");
