@@ -13,7 +13,7 @@ const {
 
 const { extractReceiptDataFromPDF } = require("./pdfOcr");
 const { analyzeReceiptWithAI } = require("./aiReceipt");
-const { parseMessage } = require("./parser");
+const { parseIndoAmount, parseFreeText, looksLikeMoney } = require("./chatParser");
 const { guessTransaction } = require("./categorizer");
 const { parseWithAI } = require("./ai");
 const { listAutoTransactions, addAutoTransaction, deleteAutoTransaction, setActive } = require("./autotx");
@@ -43,9 +43,9 @@ const mainKeyboard = Markup.keyboard([
   [AUTO_MENU]
 ]).resize();
 
+// Understands 25000, 5.000, 25rb, 2k, 7jt, 1,5jt, Rp 5.000 ...
 function parseAmount(text) {
-  const value = Number(String(text).replace(/[.,\s]/g, ""));
-  return Number.isFinite(value) && value > 0 ? value : null;
+  return parseIndoAmount(text);
 }
 
 function chunk(arr, size) {
@@ -148,7 +148,7 @@ const amountStep = async ctx => {
   const useMatch = text.match(/^✅\s*Use:\s*Rp\s*([\d.,]+)$/i);
   const amount = useMatch ? Number(useMatch[1].replace(/[.,]/g, "")) : parseAmount(text);
   if (!amount) {
-    return ctx.reply("Specify an amount, or tap ❌ Cancel");
+    return ctx.reply("Specify an amount (e.g. 25000, 25rb, 1,5jt), or tap ❌ Cancel");
   }
   ctx.scene.state.amount = amount;
 
@@ -258,7 +258,7 @@ const transferAmountStep = async ctx => {
     return ctx.scene.leave();
   }
   const amount = parseAmount(text);
-  if (amount === null) return ctx.reply("Specify an amount, or tap ❌ Cancel");
+  if (amount === null) return ctx.reply("Specify an amount (e.g. 25000, 25rb, 1,5jt), or tap ❌ Cancel");
   ctx.scene.state.amount = amount;
 
   const accounts = await getAccounts();
@@ -405,7 +405,7 @@ const autoAmountStep = async ctx => {
   if (!text) return;
   if (text === CANCEL) { await ctx.reply("Cancelled.", mainKeyboard); return ctx.scene.leave(); }
   const amount = parseAmount(text);
-  if (!amount) return ctx.reply("Specify a valid amount, or tap ❌ Cancel");
+  if (!amount) return ctx.reply("Specify a valid amount (e.g. 25000, 25rb, 1,5jt), or tap ❌ Cancel");
   ctx.scene.state.amount = amount;
   const categories = ctx.scene.state.type === "income" ? await getIncomeCategories() : await getExpenseCategories();
   ctx.scene.state.categories = categories;
@@ -537,6 +537,137 @@ const budgetViewWizard = new Scenes.WizardScene(
   budgetNavStep
 );
 
+// ---------- Quick-add: "which account?" (used when a chat message had no account) ----------
+
+const quickAccountWizard = new Scenes.WizardScene(
+  "QUICK_ACCOUNT_WIZARD",
+  async ctx => {
+    const { accounts, amount, type } = ctx.scene.state;
+    await ctx.reply(`Which account for the ${type} of Rp ${formatIDR(amount)}?`, optionKeyboard(accounts));
+    return ctx.wizard.next();
+  },
+  async ctx => {
+    const text = ctx.message?.text?.trim();
+    if (!text) return;
+    if (text === CANCEL) {
+      await ctx.reply("Cancelled.", mainKeyboard);
+      return ctx.scene.leave();
+    }
+    const match = (ctx.scene.state.accounts || []).find(a => a.toLowerCase() === text.toLowerCase());
+    if (!match) return ctx.reply("Pick an account from the keyboard.");
+
+    const { type, description, amount, category } = ctx.scene.state;
+    logger.info("Quick-add inserting (account picked):", { type, description, amount, category, account: match });
+    await insertTransaction({ description, category, amount, account: match, type });
+    await ctx.reply(addedMessage({ type, amount, category, account: match, description }), mainKeyboard);
+    return ctx.scene.leave();
+  }
+);
+
+// ---------- Free-form chat ----------
+
+const CHAT_HELP =
+  'I couldn\'t find an amount in that. Try e.g. "makan siang 25rb cash", "gaji 7jt bri", "Cash 5000 gorengan" — or use the buttons.';
+
+function addedMessage({ type, amount, category, account, description }) {
+  return `👍 Added ${type} Rp ${formatIDR(amount)} → ${category} (${account})${description ? ` — ${description}` : ""}`;
+}
+
+async function safeParseAI(text, lists) {
+  try {
+    return await parseWithAI(text, lists);
+  } catch (err) {
+    logger.error("AI text parse threw unexpectedly:", err);
+    return null;
+  }
+}
+
+// Order of attack (cheapest first):
+//   1. Local parser finds amount (7jt / 25rb / 5000 ...) and account anywhere in the sentence.
+//   2. Local keyword rules pick the category. Only if they're unsure (nothing matched)
+//      do we ask Gemini — and we keep the local amount/account either way.
+//   3. If the local parser can't find a usable amount, Gemini reads the whole message.
+//   4. If no account was named, ask for one with a single tap.
+async function handleChatText(ctx, text) {
+  logger.info(`Text from user ${ctx.from?.id}:`, text);
+
+  const [accounts, incomeCategories, expenseCategories] = await Promise.all([
+    getAccounts(),
+    getIncomeCategories(),
+    getExpenseCategories()
+  ]);
+  const lists = { accounts, incomeCategories, expenseCategories };
+
+  const local = parseFreeText(text, accounts);
+  logger.info("Local chat parse:", local);
+
+  if (local.multipleAccounts) {
+    return ctx.reply(
+      `I found more than one account (${local.multipleAccounts.join(", ")}). To move money between accounts use 🔁 Transfer, or mention just one account.`,
+      mainKeyboard
+    );
+  }
+
+  let draft = null; // { type, amount, category, account|null, description }
+
+  if (local.amount) {
+    const guess = guessTransaction(local.description || text, incomeCategories, expenseCategories);
+    let type = guess.type;
+    let category = guess.category;
+
+    const incomeCueMissed = local.incomeCue && type !== "income";
+    if (incomeCueMissed) {
+      type = "income";
+      category = incomeCategories.find(c => /^other$/i.test(c)) || incomeCategories[0];
+    }
+    const unsure = incomeCueMissed || (type === "expense" && /^other$/i.test(category));
+
+    draft = { type, amount: local.amount, category, account: local.account, description: local.description };
+
+    if (unsure) {
+      logger.info("Local category guess is unsure — asking AI to classify");
+      const ai = await safeParseAI(text, lists);
+      if (ai) {
+        draft.type = ai.type;
+        draft.category = ai.category;
+        if (ai.description) draft.description = ai.description;
+        if (!draft.account && ai.account) draft.account = ai.account;
+      } else {
+        logger.info("AI unavailable — keeping the local guess:", { type, category });
+      }
+    }
+  } else if (looksLikeMoney(text)) {
+    logger.info(local.ambiguousAmount ? "More than one amount in the message — asking AI" : "No local amount — asking AI");
+    draft = await safeParseAI(text, lists);
+  }
+
+  if (!draft) {
+    logger.warn("Could not understand message (local + AI):", text);
+    return ctx.reply(CHAT_HELP, mainKeyboard);
+  }
+
+  if (!draft.account) {
+    logger.info("No account in the message — asking which one");
+    return ctx.scene.enter("QUICK_ACCOUNT_WIZARD", {
+      type: draft.type,
+      amount: draft.amount,
+      category: draft.category,
+      description: draft.description,
+      accounts
+    });
+  }
+
+  logger.info("Chat quick-add inserting:", draft);
+  await insertTransaction({
+    description: draft.description,
+    category: draft.category,
+    amount: draft.amount,
+    account: draft.account,
+    type: draft.type
+  });
+  return ctx.reply(addedMessage(draft), mainKeyboard);
+}
+
 // ---------- Bot ----------
 
 function createBot(token) {
@@ -556,7 +687,8 @@ function createBot(token) {
     ocrConfirmWizard,
     autoTxAddWizard,
     autoTxPickWizard,
-    budgetViewWizard
+    budgetViewWizard,
+    quickAccountWizard
   ]);
 
   // Sessions live in Redis (Upstash) so wizard state survives between serverless invocations.
@@ -737,69 +869,11 @@ function createBot(token) {
     });
   });
 
-  // ---- Free-text quick add: strict shorthand first (free), Gemini fallback for full sentences ----
-  bot.on("text", async ctx => {
-    const text = ctx.message.text.trim();
-    logger.info(`Text from user ${ctx.from?.id}:`, text);
-
-    const [accounts, incomeCategories, expenseCategories] = await Promise.all([
-      getAccounts(),
-      getIncomeCategories(),
-      getExpenseCategories()
-    ]);
-
-    const shorthand = parseMessage(text);
-    logger.info("Shorthand parse result:", shorthand);
-
-    if (shorthand) {
-      const matchedAccount = accounts.find(a => a.toLowerCase() === shorthand.account.toLowerCase());
-      if (!matchedAccount) {
-        logger.warn(`Shorthand parsed but account "${shorthand.account}" not recognized`);
-        return ctx.reply(
-          `Didn't recognize account "${shorthand.account}". Your accounts: ${accounts.join(", ")}`,
-          mainKeyboard
-        );
-      }
-      const { type, category } = guessTransaction(shorthand.description, incomeCategories, expenseCategories);
-      const signed = await insertTransaction({
-        description: shorthand.description,
-        category,
-        amount: shorthand.amount,
-        account: matchedAccount,
-        type
-      });
-      logger.info("Shorthand transaction inserted:", { type, category, amount: shorthand.amount, account: matchedAccount });
-      return ctx.reply(`👍 Successfully added ${signed}.0 to ${category} from ${matchedAccount}!`, mainKeyboard);
-    }
-
-    logger.info("Shorthand didn't match — trying AI parse");
-    let aiTextResult = null;
-    try {
-      aiTextResult = await parseWithAI(text, { accounts, incomeCategories, expenseCategories });
-    } catch (err) {
-      logger.error("AI text parse threw unexpectedly:", err);
-    }
-
-    if (!aiTextResult) {
-      logger.warn("Could not parse message via shorthand or AI:", text);
-      return ctx.reply(
-        'Use the buttons below, or type: description amount account (e.g. "mcd 10000 cash")',
-        mainKeyboard
-      );
-    }
-
-    const signed = await insertTransaction({
-      description: aiTextResult.description,
-      category: aiTextResult.category,
-      amount: aiTextResult.amount,
-      account: aiTextResult.account,
-      type: aiTextResult.type
-    });
-    logger.info("AI transaction inserted:", aiTextResult);
-    await ctx.reply(`👍 Successfully added ${signed}.0 to ${aiTextResult.category} from ${aiTextResult.account}!`, mainKeyboard);
-  });
+  // ---- Free-form chat: understands any word order and informal money (7jt, 25rb, 2k) ----
+  bot.on("text", ctx => handleChatText(ctx, ctx.message.text.trim()));
 
   return bot;
 }
 
 module.exports = createBot;
+module.exports.handleChatText = handleChatText;
