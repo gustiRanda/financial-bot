@@ -1,5 +1,9 @@
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const logger = require("./logger");
+const { callGemini } = require("./geminiCall");
+const { parseIndoAmount } = require("./chatParser");
+
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 
 let client = null;
 function getClient() {
@@ -16,43 +20,63 @@ async function analyzeReceiptWithAI(buffer, mimeType, { accounts, expenseCategor
     return null;
   }
 
-    const prompt = `This is a receipt or proof-of-payment (image or PDF). It could be a purchase
-    receipt (restaurant, retail, delivery app, e-commerce/digital goods) OR a bank/e-wallet transfer confirmation. Extract the transaction.
+  const prompt = `This is a receipt or proof-of-payment (image or PDF). It could be a purchase
+receipt (restaurant, retail, delivery app, e-commerce/digital goods) OR a bank/e-wallet transfer confirmation. Extract the transaction.
 
-    Valid accounts (payment methods): ${accounts.join(", ")}
-    Valid expense categories: ${expenseCategories.join(", ")}
+Indonesian amounts use "." as the thousands separator and "," for cents: "IDR 23.000,00" means 23000.
 
-    Reply with ONLY a JSON object, nothing else:
-    {"amount": number (the final total actually paid, whole number, no currency symbols/decimals), "description": string (a short human-readable summary of what this was for, in this priority order: (1) if there's a specific product/item/package name listed — e.g. a phone data package, a specific menu item, a specific product — use that, since it's more useful than the store name; (2) if there's a transfer note/memo/message field, combine the purpose with the recipient's first name — e.g. "bayar utang ke Frischi"; (3) only fall back to the merchant/store/platform name (e.g. "Shopee", "GoFood") if nothing more specific is available. Never use a generic platform name like Shopee/GoFood/Grab when a specific item or note is visible on the receipt.), "category": one of the valid expense categories that best fits, "account": one of the valid accounts if identifiable from the payment method or source account shown, or null if unclear}
+Valid accounts (payment methods): ${accounts.join(", ")}
+Valid expense categories: ${expenseCategories.join(", ")}
 
-    If this doesn't look like a receipt or payment confirmation at all, reply with exactly: null`;
+Reply with ONLY a JSON object, nothing else:
+{"amount": number (the final total actually paid, whole number, no currency symbols/decimals), "description": string (a short human-readable summary of what this was for, in this priority order: (1) if there's a specific product/item/package name listed — e.g. a phone data package, a specific menu item, a specific product — use that, since it's more useful than the store name; (2) if there's a transfer note/memo/message field, combine the purpose with the recipient's first name — e.g. "bayar utang ke Frischi"; (3) only fall back to the merchant/store/platform name (e.g. "Shopee", "GoFood") if nothing more specific is available. Never use a generic platform name like Shopee/GoFood/Grab when a specific item or note is visible on the receipt.), "category": one of the valid expense categories that best fits, "account": one of the valid accounts if identifiable from the payment method or source account shown, or null if unclear}
+
+If this doesn't look like a receipt or payment confirmation at all, reply with exactly: null`;
+
+  const started = Date.now();
+  logger.info(`Receipt AI: sending ${Math.round(buffer.length / 1024)} KB (${mimeType}) to ${MODEL}`);
+
+  let raw;
+  try {
+    const model = ai.getGenerativeModel({ model: MODEL });
+    const result = await callGemini(
+      () =>
+        model.generateContent({
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: prompt }, { inlineData: { mimeType, data: buffer.toString("base64") } }]
+            }
+          ]
+        }),
+      {
+        label: "Receipt AI",
+        // Tunable from the Vercel env vars without touching code (redeploy to apply).
+        attemptTimeoutMs: Number(process.env.GEMINI_ATTEMPT_TIMEOUT_MS) || 15000,
+        totalBudgetMs: Number(process.env.GEMINI_TOTAL_BUDGET_MS) || 35000
+      }
+    );
+    raw = result.response.text().trim();
+  } catch (err) {
+    logger.error(`Receipt AI: call failed after ${Date.now() - started}ms:`, err.message || err);
+    return null;
+  }
+
+  logger.info(`Receipt AI: answered in ${Date.now() - started}ms, raw response:`, raw);
+  if (!raw || raw === "null") return null;
 
   try {
-    const model = ai.getGenerativeModel({ model: "gemini-3.6-flash" });
-    const result = await model.generateContent({
-      contents: [
-        {
-          role: "user",
-          parts: [
-            { text: prompt },
-            { inlineData: { mimeType, data: buffer.toString("base64") } }
-          ]
-        }
-      ]
-    });
-    const raw = result.response.text().trim();
-    logger.info("Receipt AI: raw response:", raw);
-    if (!raw || raw === "null") return null;
-
     const parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
-    if (!parsed.amount) {
-      logger.warn("Receipt AI: no amount in response, treating as failure:", parsed);
+    const amount = typeof parsed.amount === "number" ? Math.round(parsed.amount) : parseIndoAmount(parsed.amount);
+    if (!amount) {
+      logger.warn("Receipt AI: no usable amount in response, treating as failure:", parsed);
       return null;
     }
+    parsed.amount = amount;
     logger.info("Receipt AI: parsed:", parsed);
     return parsed;
   } catch (err) {
-    logger.error("Receipt AI: call failed:", err.message || err);
+    logger.error("Receipt AI: couldn't parse Gemini's reply as JSON:", err.message);
     return null;
   }
 }

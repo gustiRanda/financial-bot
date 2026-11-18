@@ -63,8 +63,10 @@ function formatIDR(n) {
 }
 
 async function downloadBuffer(url) {
-  const res = await fetch(url); // Node 18+ has global fetch
+  const t = Date.now();
+  const res = await fetch(url, { signal: AbortSignal.timeout(15000) }); // never hang on a slow download
   const arrayBuffer = await res.arrayBuffer();
+  logger.info(`Downloaded file: ${arrayBuffer.byteLength} bytes in ${Date.now() - t}ms`);
   return Buffer.from(arrayBuffer);
 }
 
@@ -671,7 +673,19 @@ async function handleChatText(ctx, text) {
 // ---------- Bot ----------
 
 function createBot(token) {
-  const bot = new Telegraf(token);
+  // Telegraf's default handler timeout is 90s, but Telegram re-sends an update after ~60s.
+  // Give up at 50s so we always answer Telegram first.
+  const bot = new Telegraf(token, { handlerTimeout: Number(process.env.HANDLER_TIMEOUT_MS) || 50000 });
+
+  // Any error inside a handler: log it, and tell the user instead of staying silent.
+  bot.catch(async (err, ctx) => {
+    logger.error(`Handler error for update ${ctx?.update?.update_id}:`, err?.stack || err);
+    try {
+      await ctx.reply("⚠️ Something went wrong with that. Please try again, or use the buttons.", mainKeyboard);
+    } catch (replyErr) {
+      logger.error("Couldn't send the error message to the user:", replyErr.message);
+    }
+  });
 
   // Owner-only guard: the webhook URL is public, so ignore anyone but you.
   // If OWNER_USER_ID isn't set, everyone is allowed (set it!).

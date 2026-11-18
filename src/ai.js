@@ -1,6 +1,7 @@
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const logger = require("./logger");
 const { parseIndoAmount } = require("./chatParser");
+const { callGemini } = require("./geminiCall");
 
 // Same model your working version used. Set GEMINI_MODEL in the env to switch
 // models without touching code (handy when one model is overloaded).
@@ -12,33 +13,6 @@ function getClient() {
     client = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
   }
   return client;
-}
-
-// ---- retry on temporary Gemini errors (503 "high demand", 429 rate limit) ----
-function isRetryableError(err) {
-  const msg = String(err?.message || err).toLowerCase();
-  return msg.includes("503") || msg.includes("overloaded") || msg.includes("high demand") || msg.includes("429") || msg.includes("rate limit");
-}
-
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-
-async function withRetry(fn, maxRetries = 2) {
-  let lastErr;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      if (attempt < maxRetries && isRetryableError(err)) {
-        const delayMs = 1000 * (attempt + 1);
-        logger.warn(`AI parse: temporary Gemini error (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${delayMs}ms:`, err.message);
-        await sleep(delayMs);
-        continue;
-      }
-      throw err;
-    }
-  }
-  throw lastErr;
 }
 
 // ---- make sure the AI's answer only contains things that really exist in the sheet ----
@@ -105,8 +79,9 @@ If the message contains no transaction amount at all, reply with exactly: null`;
   let raw;
   try {
     const model = ai.getGenerativeModel({ model: MODEL });
-    const result = await withRetry(() =>
-      model.generateContent({ contents: [{ role: "user", parts: [{ text: prompt }] }] })
+    const result = await callGemini(
+      () => model.generateContent({ contents: [{ role: "user", parts: [{ text: prompt }] }] }),
+      { label: "AI parse", attemptTimeoutMs: 10000, totalBudgetMs: 20000 }
     );
     raw = result.response.text().trim();
   } catch (err) {

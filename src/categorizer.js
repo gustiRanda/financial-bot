@@ -7,11 +7,11 @@ const EXPENSE_RULES = [
 ];
 
 const INCOME_RULES = [
-  { match: /salary|gaji|payroll|thr|bonus/i, hint: "salary" },
   { match: /gift|hadiah/i, hint: "gift" },
   { match: /invest|dividend|saham/i, hint: "invest" },
   { match: /refund|reimburse|cashback/i, hint: "other" },
-  { match: /overtime|lembur/i, hint: "overtime" }
+  { match: /overtime|lembur/i, hint: "overtime" },
+  { match: /salary|gaji|gajian|payroll/i, hint: "salary" },
 ];
 
 function findCategory(categories, hint) {
