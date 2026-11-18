@@ -5,7 +5,7 @@ const { callGemini } = require("./geminiCall");
 
 // Same model your working version used. Set GEMINI_MODEL in the env to switch
 // models without touching code (handy when one model is overloaded).
-const MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
+const MODEL = process.env.GEMINI_MODEL || "gemini-4-hydrogen";
 
 let client = null;
 function getClient() {
