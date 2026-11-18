@@ -46,6 +46,22 @@ async function runAutoTransactionCheck(bot, opts = {}) {
 
     logger.info(`Due: "${item.description}" — Rp ${formatIDR(item.amount)} → ${item.category} (${item.account})`);
 
+    // Never write a broken amount (NaN / 0 / negative) into Transactions — skip and tell the owner.
+    if (!Number.isFinite(item.amount) || item.amount <= 0) {
+      logger.error(`Skip "${item.description}": the amount isn't a valid number (${item.amount}). Check the Amount cell in AutoTransactions.`);
+      if (!dryRun && item.chatId) {
+        try {
+          await bot.telegram.sendMessage(
+            item.chatId,
+            `⚠️ Auto-transaction "${item.description}" was skipped: its amount couldn't be read. Please check the Amount cell in the AutoTransactions sheet.`
+          );
+        } catch (err) {
+          logger.error("Couldn't send the skipped-rule warning:", err.message);
+        }
+      }
+      continue;
+    }
+
     if (dryRun) {
       logger.info(`DRY RUN: would insert + notify chat ${item.chatId}, skipping actual write.`);
       continue;

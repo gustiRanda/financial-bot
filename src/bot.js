@@ -70,6 +70,42 @@ async function downloadBuffer(url) {
   return Buffer.from(arrayBuffer);
 }
 
+// ---------- Auto-transaction list (same look as the Available summary) ----------
+
+function escapeHtml(text) {
+  return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function clip(text, max) {
+  const t = String(text ?? "");
+  return t.length > max ? t.slice(0, max - 1) + "…" : t;
+}
+
+// 🟢 active income   🔴 active expense   ⏸️ paused
+function renderAutoList(list) {
+  if (!list.length) {
+    return "<b>🔁 Auto Transactions</b>\nNo auto-transactions yet. Tap ➕ to add one.";
+  }
+
+  const active = list.filter(a => a.active);
+  const sum = type => active.filter(a => (a.type === "income") === (type === "income")).reduce((n, a) => n + a.amount, 0);
+
+  const summaryBlock = [
+    `Income/month   Rp ${formatIDR(sum("income"))}`,
+    `Expense/month  Rp ${formatIDR(sum("expense"))}`
+  ].join("\n");
+
+  const nameWidth = Math.min(Math.max(...list.map(a => a.description.length), 4), 20) + 1;
+  const ruleLines = list.map(a => {
+    const emoji = !a.active ? "⏸️" : a.type === "income" ? "🟢" : "🔴";
+    const top = `${emoji} ${clip(a.description, 20).padEnd(nameWidth)}Rp ${formatIDR(a.amount).padStart(10)}`;
+    const bottom = `   day ${a.dayOfMonth} · ${clip(a.category, 16)} → ${clip(a.account, 9)}`;
+    return `${escapeHtml(top)}\n${escapeHtml(bottom)}`;
+  });
+
+  return `<b>🔁 Auto Transactions</b>\n<pre>${summaryBlock}\n\nRULES\n${ruleLines.join("\n")}</pre>`;
+}
+
 // ---------- Budget rendering ----------
 
 function truncateName(name, width) {
@@ -738,10 +774,10 @@ function createBot(token) {
 
   bot.hears(AUTO_MENU, async ctx => {
     const list = await listAutoTransactions();
-    const lines = list.length
-      ? list.map(a => `${a.active ? "🟢" : "⏸️"} ${a.description} — Rp ${formatIDR(a.amount)} → ${a.category} (${a.account}), day ${a.dayOfMonth}`)
-      : ["No auto-transactions yet."];
-    await ctx.reply(lines.join("\n"), Markup.keyboard([[AUTO_ADD], [AUTO_DELETE, AUTO_TOGGLE], [AUTO_BACK]]).resize());
+    await ctx.replyWithHTML(
+      renderAutoList(list),
+      Markup.keyboard([[AUTO_ADD], [AUTO_DELETE, AUTO_TOGGLE], [AUTO_BACK]]).resize()
+    );
   });
   bot.hears(AUTO_ADD, ctx => ctx.scene.enter("AUTO_TX_ADD_WIZARD"));
   bot.hears(AUTO_DELETE, ctx => ctx.scene.enter("AUTO_TX_PICK_WIZARD", { action: "delete" }));
@@ -891,3 +927,4 @@ function createBot(token) {
 
 module.exports = createBot;
 module.exports.handleChatText = handleChatText;
+module.exports.renderAutoList = renderAutoList;
