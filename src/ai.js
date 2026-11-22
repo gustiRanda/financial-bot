@@ -1,11 +1,9 @@
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const logger = require("./logger");
 const { parseIndoAmount } = require("./chatParser");
-const { callGemini } = require("./geminiCall");
+const { callGeminiWithFallback, getModelList } = require("./geminiCall");
 
-// Same model your working version used. Set GEMINI_MODEL in the env to switch
-// models without touching code (handy when one model is overloaded).
-const MODEL = process.env.GEMINI_MODEL || "gemini-4-hydrogen";
+// Models come from GEMINI_MODEL and GEMINI_FALLBACK_MODELS (see geminiCall.js).
 
 let client = null;
 function getClient() {
@@ -78,11 +76,15 @@ If the message contains no transaction amount at all, reply with exactly: null`;
 
   let raw;
   try {
-    const model = ai.getGenerativeModel({ model: MODEL });
-    const result = await callGemini(
-      () => model.generateContent({ contents: [{ role: "user", parts: [{ text: prompt }] }] }),
+    const { result, model: usedModel } = await callGeminiWithFallback(
+      getModelList(),
+      modelName =>
+        ai.getGenerativeModel({ model: modelName }).generateContent({
+          contents: [{ role: "user", parts: [{ text: prompt }] }]
+        }),
       { label: "AI parse", attemptTimeoutMs: 10000, totalBudgetMs: 20000 }
     );
+    logger.info(`AI parse: model used: ${usedModel}`);
     raw = result.response.text().trim();
   } catch (err) {
     logger.error("AI parse: Gemini API call failed:", err.message || err);

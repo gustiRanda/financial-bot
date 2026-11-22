@@ -1,9 +1,7 @@
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const logger = require("./logger");
-const { callGemini, envMs } = require("./geminiCall");
+const { callGeminiWithFallback, getModelList, envMs } = require("./geminiCall");
 const { parseIndoAmount } = require("./chatParser");
-
-const MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 
 let client = null;
 function getClient() {
@@ -34,14 +32,15 @@ Reply with ONLY a JSON object, nothing else:
 If this doesn't look like a receipt or payment confirmation at all, reply with exactly: null`;
 
   const started = Date.now();
-  logger.info(`Receipt AI: sending ${Math.round(buffer.length / 1024)} KB (${mimeType}) to ${MODEL}`);
+  const models = getModelList();
+  logger.info(`Receipt AI: sending ${Math.round(buffer.length / 1024)} KB (${mimeType}) — models in order: ${models.join(" → ")}`);
 
   let raw;
   try {
-    const model = ai.getGenerativeModel({ model: MODEL });
-    const result = await callGemini(
-      () =>
-        model.generateContent({
+    const { result, model: usedModel } = await callGeminiWithFallback(
+      models,
+      modelName =>
+        ai.getGenerativeModel({ model: modelName }).generateContent({
           contents: [
             {
               role: "user",
@@ -57,6 +56,7 @@ If this doesn't look like a receipt or payment confirmation at all, reply with e
         totalBudgetMs: envMs("GEMINI_TOTAL_BUDGET_MS", 90000, 120000)
       }
     );
+    logger.info(`Receipt AI: model used: ${usedModel}`);
     raw = result.response.text().trim();
   } catch (err) {
     logger.error(`Receipt AI: call failed after ${Date.now() - started}ms:`, err.message || err);
