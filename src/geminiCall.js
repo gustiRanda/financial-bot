@@ -90,8 +90,8 @@ async function callGemini(fn, opts = {}) {
 // Free-tier quota is counted per model, so every backup model has its own daily allowance.
 // ---------------------------------------------------------------------------
 function getModelList() {
-  const primary = (process.env.GEMINI_MODEL || "gemini-4-hydrogen").trim();
-  const extra = (process.env.GEMINI_FALLBACK_MODELS || "gemini-3.8-flash")
+  const primary = (process.env.GEMINI_MODEL || "gemini-3.6-flash").trim();
+  const extra = (process.env.GEMINI_FALLBACK_MODELS || "gemini-3.6-flash")
     .split(",")
     .map(s => s.trim())
     .filter(Boolean);
@@ -134,11 +134,15 @@ async function callGeminiWithFallback(models, makeCall, opts = {}) {
     if (remaining < 1500) break;
 
     const isLast = i === candidates.length - 1;
+    // Fair share: one model that hangs must not eat the whole budget and leave the backup
+    // with a few seconds. With 2 models left each gets half of what remains; the last model
+    // gets everything that's left (so a fast failure on the first hands its time on).
+    const share = Math.floor(remaining / (candidates.length - i));
     try {
       const result = await callGemini(() => makeCall(model), {
         ...opts,
         label: `${label} [${model}]`,
-        totalBudgetMs: remaining,
+        totalBudgetMs: share,
         // With a backup waiting, switch models sooner instead of retrying the same one for long.
         maxRetries: isLast ? maxRetries : 1,
         retryOnTimeout: isLast
@@ -158,7 +162,8 @@ async function callGeminiWithFallback(models, makeCall, opts = {}) {
         logger.error(`${label}: model "${model}" wasn't found — check GEMINI_MODEL / GEMINI_FALLBACK_MODELS`);
       } else if (kind === "overloaded" || kind === "timeout") {
         coolDown(model, 30 * 1000);
-        logger.warn(`${label}: ${model} is ${kind === "timeout" ? "too slow" : "overloaded"}${isLast ? "" : " — trying the next model"}`);
+        // "timeout" only means no answer arrived in the time we allowed — not that the model is slow in general.
+        logger.warn(`${label}: ${model} ${kind === "timeout" ? `gave no answer within its ${Math.round(share / 1000)}s` : "is overloaded"}${isLast ? "" : " — trying the next model"}`);
       } else {
         throw err; // bad request / bad key: another model won't fix it
       }
