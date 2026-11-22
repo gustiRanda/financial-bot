@@ -32,8 +32,8 @@ if (!imagePath || !fs.existsSync(imagePath)) {
 
 // Models: from the command line, else GEMINI_MODEL + GEMINI_FALLBACK_MODELS (same rule as the bot).
 const fromEnv = [
-  (process.env.GEMINI_MODEL || "gemini-3.6-flash").trim(),
-  ...(process.env.GEMINI_FALLBACK_MODELS || "gemini-3.6-flash").split(",").map(s => s.trim()).filter(Boolean)
+  (process.env.GEMINI_MODEL || "gemini-4-hydrogen").trim(),
+  ...(process.env.GEMINI_FALLBACK_MODELS || "gemini-3.8-flash").split(",").map(s => s.trim()).filter(Boolean)
 ];
 const models = [...new Set(positional.length > 1 ? positional.slice(1) : fromEnv)];
 
