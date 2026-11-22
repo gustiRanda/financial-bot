@@ -56,4 +56,17 @@ async function callGemini(fn, opts = {}) {
   throw lastErr || new Error(`${label}: no time budget left`);
 }
 
-module.exports = { callGemini };
+// Reads a millisecond setting from the environment, but never lets it go above `max`.
+// Why a ceiling: Vercel stops the webhook function at 150s (see vercel.json), and the AI time
+// plus downloading the file and reading the sheet has to fit inside that.
+function envMs(name, fallback, max) {
+  const raw = Number(process.env[name]);
+  if (!raw) return fallback;
+  if (raw > max) {
+    logger.warn(`${name}=${raw} is above the safe maximum, using ${max}ms instead (the function is stopped at 150s).`);
+    return max;
+  }
+  return raw;
+}
+
+module.exports = { callGemini, envMs };

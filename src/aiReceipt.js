@@ -1,6 +1,6 @@
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const logger = require("./logger");
-const { callGemini } = require("./geminiCall");
+const { callGemini, envMs } = require("./geminiCall");
 const { parseIndoAmount } = require("./chatParser");
 
 const MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
@@ -51,9 +51,10 @@ If this doesn't look like a receipt or payment confirmation at all, reply with e
         }),
       {
         label: "Receipt AI",
-        // Tunable from the Vercel env vars without touching code (redeploy to apply).
-        attemptTimeoutMs: Number(process.env.GEMINI_ATTEMPT_TIMEOUT_MS) || 15000,
-        totalBudgetMs: Number(process.env.GEMINI_TOTAL_BUDGET_MS) || 35000
+        // Defaults: 45s per attempt, 90s in total. Tunable from the Vercel env vars, but capped
+        // (90s / 120s) so the whole message still finishes inside the 150s function limit.
+        attemptTimeoutMs: envMs("GEMINI_ATTEMPT_TIMEOUT_MS", 45000, 90000),
+        totalBudgetMs: envMs("GEMINI_TOTAL_BUDGET_MS", 90000, 120000)
       }
     );
     raw = result.response.text().trim();

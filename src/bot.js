@@ -64,10 +64,29 @@ function formatIDR(n) {
 
 async function downloadBuffer(url) {
   const t = Date.now();
-  const res = await fetch(url, { signal: AbortSignal.timeout(15000) }); // never hang on a slow download
+  const res = await fetch(url, { signal: AbortSignal.timeout(10000) }); // never hang on a slow download
   const arrayBuffer = await res.arrayBuffer();
   logger.info(`Downloaded file: ${arrayBuffer.byteLength} bytes in ${Date.now() - t}ms`);
   return Buffer.from(arrayBuffer);
+}
+
+// A short "reading..." message so a slow AI never looks like a dead bot (and you don't re-send the photo).
+async function sendAck(ctx, text) {
+  try {
+    return await ctx.reply(text);
+  } catch (err) {
+    logger.warn("Couldn't send the 'reading' message:", err.message);
+    return null;
+  }
+}
+
+async function clearAck(ctx, ack) {
+  if (!ack) return;
+  try {
+    await ctx.deleteMessage(ack.message_id);
+  } catch (err) {
+    /* already deleted or too old — nothing to do */
+  }
 }
 
 // ---------- Auto-transaction list (same look as the Available summary) ----------
@@ -709,9 +728,10 @@ async function handleChatText(ctx, text) {
 // ---------- Bot ----------
 
 function createBot(token) {
-  // Telegraf's default handler timeout is 90s, but Telegram re-sends an update after ~60s.
-  // Give up at 50s so we always answer Telegram first.
-  const bot = new Telegraf(token, { handlerTimeout: Number(process.env.HANDLER_TIMEOUT_MS) || 50000 });
+  // The webhook answers Telegram immediately and finishes the work in the background (see
+  // api/telegram.js), so a message may take a while. Give up at 110s by default (max 140s),
+  // which is inside the 150s function limit in vercel.json.
+  const bot = new Telegraf(token, { handlerTimeout: Math.min(Number(process.env.HANDLER_TIMEOUT_MS) || 110000, 140000) });
 
   // Any error inside a handler: log it, and tell the user instead of staying silent.
   bot.catch(async (err, ctx) => {
@@ -787,6 +807,7 @@ function createBot(token) {
   // ---- Photo receipt: Gemini only (no local Tesseract on Vercel) ----
   bot.on("photo", async ctx => {
     logger.info(`Photo received from user ${ctx.from?.id}`);
+    const ack = await sendAck(ctx, "🔍 Reading your receipt… (this can take up to a minute)");
     const photos = ctx.message.photo;
     const fileId = photos[photos.length - 1].file_id;
     const fileLink = await ctx.telegram.getFileLink(fileId);
@@ -799,6 +820,7 @@ function createBot(token) {
     let category = null;
 
     const aiResult = await analyzeReceiptWithAI(buffer, "image/jpeg", { accounts, expenseCategories });
+    await clearAck(ctx, ack);
 
     if (aiResult) {
       logger.info("Photo: using AI extraction", aiResult);
@@ -853,6 +875,7 @@ function createBot(token) {
     }
 
     logger.info(`PDF received from user ${ctx.from?.id}: ${doc.file_name}`);
+    const ack = await sendAck(ctx, "🔍 Reading your PDF… (this can take up to a minute)");
     const fileLink = await ctx.telegram.getFileLink(doc.file_id);
     const [accounts, expenseCategories] = await Promise.all([getAccounts(), getExpenseCategories()]);
     const buffer = await downloadBuffer(fileLink.href);
@@ -862,6 +885,7 @@ function createBot(token) {
     let category = null;
 
     const aiResult = await analyzeReceiptWithAI(buffer, "application/pdf", { accounts, expenseCategories });
+    await clearAck(ctx, ack);
 
     if (aiResult) {
       logger.info("PDF: using AI extraction", aiResult);
