@@ -1,7 +1,7 @@
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const logger = require("./logger");
 const { parseIndoAmount } = require("./chatParser");
-const { callGeminiWithFallback, getModelList } = require("./geminiCall");
+const { callGeminiWithFallback, getModelList, envMsAllowZero } = require("./geminiCall");
 
 // Models come from GEMINI_MODEL and GEMINI_FALLBACK_MODELS (see geminiCall.js).
 
@@ -82,7 +82,7 @@ If the message contains no transaction amount at all, reply with exactly: null`;
         ai.getGenerativeModel({ model: modelName }).generateContent({
           contents: [{ role: "user", parts: [{ text: prompt }] }]
         }),
-      { label: "AI parse", attemptTimeoutMs: 10000, totalBudgetMs: 20000 }
+      { label: "AI parse", attemptTimeoutMs: 10000, totalBudgetMs: 20000, hedgeAfterMs: envMsAllowZero("GEMINI_TEXT_HEDGE_AFTER_MS", 6000, 20000) }
     );
     logger.info(`AI parse: model used: ${usedModel}`);
     raw = result.response.text().trim();

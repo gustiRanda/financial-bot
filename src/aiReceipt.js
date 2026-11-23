@@ -1,6 +1,6 @@
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const logger = require("./logger");
-const { callGeminiWithFallback, getModelList, envMs } = require("./geminiCall");
+const { callGeminiWithFallback, getModelList, envMs, envMsAllowZero } = require("./geminiCall");
 const { parseIndoAmount } = require("./chatParser");
 
 let client = null;
@@ -50,10 +50,14 @@ If this doesn't look like a receipt or payment confirmation at all, reply with e
         }),
       {
         label: "Receipt AI",
-        // Defaults: 45s per attempt, 90s in total. Tunable from the Vercel env vars, but capped
-        // (90s / 120s) so the whole message still finishes inside the 150s function limit.
-        attemptTimeoutMs: envMs("GEMINI_ATTEMPT_TIMEOUT_MS", 45000, 90000),
-        totalBudgetMs: envMs("GEMINI_TOTAL_BUDGET_MS", 90000, 120000)
+        // One shared budget for all models: default 90s, capped at 120s so the whole message
+        // still finishes inside the 150s function limit.
+        totalBudgetMs: envMs("GEMINI_TOTAL_BUDGET_MS", 90000, 120000),
+        // With 2+ models: if the first is still silent after this long, ALSO ask the next one
+        // (without cancelling the first — the first valid answer wins). 0 = off (one at a time).
+        hedgeAfterMs: envMsAllowZero("GEMINI_HEDGE_AFTER_MS", 15000, 60000),
+        // Only used when there is a single model, or hedging is off.
+        attemptTimeoutMs: envMs("GEMINI_ATTEMPT_TIMEOUT_MS", 45000, 90000)
       }
     );
     logger.info(`Receipt AI: model used: ${usedModel}`);
