@@ -85,17 +85,26 @@ async function callGemini(fn, opts = {}) {
 
 // ---------------------------------------------------------------------------
 // Several models, in priority order.
-//   GEMINI_MODEL            main model (default gemini-3.6-flash)
-//   GEMINI_FALLBACK_MODELS  comma-separated backups, e.g. "gemini-3.8-flash"
+//   GEMINI_MODEL            main model (default gemini-4-hydrogen)
+//   GEMINI_FALLBACK_MODELS  comma-separated backups, e.g. "gemini-3.8-flash,gemini-3.5-flash-lite"
 // Free-tier quota is counted per model, so every backup model has its own daily allowance.
 // ---------------------------------------------------------------------------
 function getModelList() {
   const primary = (process.env.GEMINI_MODEL || "gemini-4-hydrogen").trim();
-  const extra = (process.env.GEMINI_FALLBACK_MODELS || "gemini-3.8-flash")
+  const extra = (process.env.GEMINI_FALLBACK_MODELS || "gemini-3.8-flash,gemini-3.5-flash-lite")
     .split(",")
     .map(s => s.trim())
     .filter(Boolean);
   return [...new Set([primary, ...extra])];
+}
+
+// Sets thinkingLevel: "low" on Gemini 3.8+ / 4 models so Hydrogen doesn't default
+// to "high" thinking on receipt OCR, while omitting it on 3.5-flash-lite.
+function getThinkingConfig(model) {
+  if (/^gemini-(3\.[689]|4)/i.test(model)) {
+    return { thinkingConfig: { thinkingLevel: "low" } };
+  }
+  return {};
 }
 
 // A model that just failed is moved aside for a while, so the next messages don't wait on it and
@@ -204,19 +213,20 @@ const HOUR = 3600 * 1000;
 const SLOW_COOLDOWN_MS = Number(process.env.GEMINI_SLOW_COOLDOWN_MS) || 15 * 60 * 1000;
 
 function noteFailure(label, model, kind, err, isLast, extra = "") {
+  const snippet = errText(err).slice(0, 180);
   if (kind === "quota") {
     const waitMs = Math.min(retryAfterMs(err) ?? HOUR, 24 * HOUR);
     coolDown(model, waitMs, "quota");
-    logger.warn(`${label}: ${model} is out of quota (resets in about ${Math.round(waitMs / 60000)} min)${isLast ? "" : " — using the next model"}`);
+    logger.warn(`${label}: ${model} is out of quota (resets in about ${Math.round(waitMs / 60000)} min)${isLast ? "" : " — using the next model"} | ${snippet}`);
   } else if (kind === "notfound") {
     coolDown(model, 24 * HOUR, "notfound");
-    logger.error(`${label}: model "${model}" wasn't found — check GEMINI_MODEL / GEMINI_FALLBACK_MODELS`);
+    logger.error(`${label}: model "${model}" wasn't found — check GEMINI_MODEL / GEMINI_FALLBACK_MODELS | ${snippet}`);
   } else if (kind === "overloaded") {
     coolDown(model, 60 * 1000, "overloaded");
-    logger.warn(`${label}: ${model} is overloaded${isLast ? "" : " — using the next model"}${extra}`);
+    logger.warn(`${label}: ${model} is overloaded${isLast ? "" : " — using the next model"}${extra} | ${snippet}`);
   } else if (kind === "timeout") {
     coolDown(model, SLOW_COOLDOWN_MS, "slow");
-    logger.warn(`${label}: ${model} gave no answer in time${isLast ? "" : " — using the next model"}${extra}`);
+    logger.warn(`${label}: ${model} gave no answer in time${isLast ? "" : " — using the next model"}${extra} | ${snippet}`);
   }
 }
 
@@ -403,6 +413,7 @@ module.exports = {
   callGemini,
   callGeminiWithFallback,
   getModelList,
+  getThinkingConfig,
   envMs,
   envMsAllowZero,
   classifyError,
