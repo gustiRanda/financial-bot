@@ -90,8 +90,8 @@ async function callGemini(fn, opts = {}) {
 // Free-tier quota is counted per model, so every backup model has its own daily allowance.
 // ---------------------------------------------------------------------------
 function getModelList() {
-  const primary = (process.env.GEMINI_MODEL || "gemini-3.6-flash").trim();
-  const extra = (process.env.GEMINI_FALLBACK_MODELS || "gemini-3.6-flash")
+  const primary = (process.env.GEMINI_MODEL || "gemini-4-hydrogen").trim();
+  const extra = (process.env.GEMINI_FALLBACK_MODELS || "gemini-3.8-flash")
     .split(",")
     .map(s => s.trim())
     .filter(Boolean);
